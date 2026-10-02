@@ -1,7 +1,7 @@
 {
   "name": "dsh-sql",
   "version": "0.4.4",
-  "description": "DSH 数据库插件：SQLite / MySQL / PostgreSQL 查询与管理，只读模式、写操作审批与流式行数钳制。",
+  "description": "连接 SQLite、MySQL 或 PostgreSQL，查询数据并检查数据库结构。",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
@@ -17,7 +17,9 @@
     "lib",
     "cordis.patch.yml",
     "README.md",
-    "README.en.md"
+    "README.en.md",
+    "docs",
+    "CHANGELOG.md"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
