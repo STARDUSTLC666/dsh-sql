@@ -2,6 +2,8 @@
 
 [中文](README.md)
 
+![dsh-sql whale girl plugin cover](https://raw.githubusercontent.com/STARDUSTLC666/dsh-sql/master/assets/cover-whale-girl.png)
+
 Connect SQLite, MySQL or PostgreSQL to query data and inspect schemas.
 
 [![npm](https://img.shields.io/npm/v/dsh-sql)](https://www.npmjs.com/package/dsh-sql) [![downloads](https://img.shields.io/npm/dm/dsh-sql)](https://www.npmjs.com/package/dsh-sql)
