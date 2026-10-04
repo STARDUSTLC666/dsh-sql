@@ -6,7 +6,7 @@
 
 连接 SQLite、MySQL 或 PostgreSQL，查询数据并检查数据库结构。
 
-[![npm](https://img.shields.io/npm/v/dsh-sql)](https://www.npmjs.com/package/dsh-sql) [![downloads](https://img.shields.io/npm/dm/dsh-sql)](https://www.npmjs.com/package/dsh-sql)
+[![npm](https://img.shields.io/npm/v/dsh-sql)](https://www.npmjs.com/package/dsh-sql) [![downloads](https://raw.githubusercontent.com/STARDUSTLC666/dsh-suite/npm-downloads/assets/dsh-sql-downloads.svg)](https://www.npmjs.com/package/dsh-sql)
 
 ## 功能
 

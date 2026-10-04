@@ -6,7 +6,7 @@
 
 Connect SQLite, MySQL or PostgreSQL to query data and inspect schemas.
 
-[![npm](https://img.shields.io/npm/v/dsh-sql)](https://www.npmjs.com/package/dsh-sql) [![downloads](https://img.shields.io/npm/dm/dsh-sql)](https://www.npmjs.com/package/dsh-sql)
+[![npm](https://img.shields.io/npm/v/dsh-sql)](https://www.npmjs.com/package/dsh-sql) [![downloads](https://raw.githubusercontent.com/STARDUSTLC666/dsh-suite/npm-downloads/assets/dsh-sql-downloads.svg)](https://www.npmjs.com/package/dsh-sql)
 
 ## What it does
 
