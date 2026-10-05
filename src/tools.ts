@@ -408,6 +408,9 @@ export function buildSqlTools(config: ResolvedSqlConfig): { tools: SqlToolDefini
       }
       if (format === 'csv') return { ...base, format, formatted: toCsv(result.columns, rows) }
       if (format === 'json') {
+        if (new Set(result.columns).size !== result.columns.length) {
+          return { ...base, format, formatted: JSON.stringify({ columns: result.columns, rows }, null, 2) }
+        }
         const objects = rows.map((row) => Object.fromEntries(result.columns.map((column, i) => [column, row[i]])))
         return { ...base, format, formatted: JSON.stringify(objects, null, 2) }
       }

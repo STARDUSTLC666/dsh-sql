@@ -2,6 +2,10 @@
 
 [Overview](../README.en.md) · [Changelog](../CHANGELOG.md) · [Validation](VALIDATION.md)
 
+## Current improvements
+
+Safe integers remain numbers; larger integers are decimal strings. JSON with duplicate column names uses { columns, rows }; other JSON remains an object array. SQLite currently executes synchronously: row limits bound returned data but cannot interrupt an already-running expensive statement. Avoid unbounded complex queries on unknown data.
+
 ## Installation
 
 ```bash

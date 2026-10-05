@@ -2,6 +2,10 @@
 
 [返回简介](../README.md) · [更新记录](../CHANGELOG.md) · [验证记录](VALIDATION.md)
 
+## 本次改进
+
+安全范围内整数保持 number，超出范围按十进制字符串输出。同名列 JSON 使用 { columns, rows }，其他 JSON 仍为对象数组。SQLite 当前使用同步执行：行数上限限制返回数据，不能中断已运行的耗时 SQL；请避免对未知数据执行无界复杂查询。
+
 ## 安装
 
 ```bash

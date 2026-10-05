@@ -4,7 +4,7 @@ import MysqlQuery from '../node_modules/mysql2/lib/commands/query.js'
 import pg from 'pg'
 import { createAdapter } from '../lib/index.js'
 
-function pgFixture(values, { fail = false, stall = false } = {}) {
+function pgFixture(values, { fail = false, stall = false, columns = ['a'] } = {}) {
   const adapter = createAdapter({ name: 'pg', engine: 'postgres', database: 'app' })
   const state = { released: [], produced: 0, query: undefined }
   adapter.pool = {
@@ -17,11 +17,11 @@ function pgFixture(values, { fail = false, stall = false } = {}) {
           queueMicrotask(() => {
             if (stall) return
             if (fail) return query.emit('error', new Error('pg query failed'))
-            query.handleRowDescription({ fields: [{ name: 'a', dataTypeID: 23, format: 'text' }] })
+            query.handleRowDescription({ fields: columns.map(name => ({ name, dataTypeID: 23, format: 'text' })) })
             for (const value of values) {
               if (state.released.includes(true)) break
               state.produced += 1
-              query.handleDataRow({ fields: [Buffer.from(String(value))] })
+              query.handleDataRow({ fields: (Array.isArray(value) ? value : [value]).map(item => Buffer.from(String(item))) })
             }
             if (state.released.includes(true)) query.emit('error', new Error('connection closed'))
             else query.emit('end', query._result)
@@ -43,7 +43,7 @@ test('PostgreSQL：真实 pg.Query 行事件在上限结束，内部不累计结
   assert.deepEqual(state.query._result.rows, [])
 })
 
-function mysqlFixture(values, { fail = false, stall = false } = {}) {
+function mysqlFixture(values, { fail = false, stall = false, columns = ['a'] } = {}) {
   const adapter = createAdapter({ name: 'my', engine: 'mysql', database: 'app' })
   const state = { destroyed: false, released: false, produced: 0 }
   adapter.pool = {
@@ -61,7 +61,8 @@ function mysqlFixture(values, { fail = false, stall = false } = {}) {
               if (stall) return
               if (fail) { ended = true; query.emit('error', new Error('mysql query failed')); return }
               while (!paused && !state.destroyed && state.produced < values.length) {
-                query.emit('result', { a: values[state.produced++] })
+                const value = values[state.produced++]
+                query.emit('result', Array.isArray(value) ? value : { a: value })
               }
               if (!state.destroyed && state.produced === values.length) {
                 ended = true
@@ -72,7 +73,7 @@ function mysqlFixture(values, { fail = false, stall = false } = {}) {
               pause() { paused = true },
               resume() { paused = false; queueMicrotask(pump) },
             }
-            queueMicrotask(() => { query.emit('fields', [{ name: 'a' }]); pump() })
+            queueMicrotask(() => { query.emit('fields', columns.map(name => ({ name }))); pump() })
             return query
           },
         },
@@ -110,6 +111,17 @@ test('PostgreSQL：有界查询转发驱动错误并归还连接', async () => {
   const { adapter, state } = pgFixture([], { fail: true })
   await assert.rejects(adapter.query('SELECT broken', 10), /pg query failed/)
   assert.deepEqual(state.released, [false])
+})
+
+test('MySQL / PostgreSQL：行数组保留同名列的不同值，零行也保留两列', async () => {
+  for (const makeFixture of [mysqlFixture, pgFixture]) {
+    for (const values of [[], [[1, 2]]]) {
+      const { adapter } = makeFixture(values, { columns: ['value', 'value'] })
+      assert.deepEqual(await adapter.query('SELECT 1 AS value, 2 AS value', 10), {
+        columns: ['value', 'value'], rows: values,
+      })
+    }
+  }
 })
 
 test('MySQL：有界查询转发 Readable 错误', async () => {
@@ -150,7 +162,8 @@ test('查询结果 bigint：安全整数转 number，超出安全范围转十进
   const adapter = createAdapter({ name: 'my', engine: 'mysql', database: 'app' })
   adapter.pool = {
     async query(sql) {
-      assert.equal(sql, 'SELECT safe, too_large, too_small FROM t')
+      assert.equal(sql.sql, 'SELECT safe, too_large, too_small FROM t')
+      assert.equal(sql.rowsAsArray, true)
       return [[{
         safe: 9007199254740991n,
         too_large: 9007199254740993n,

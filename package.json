@@ -1,6 +1,6 @@
 {
   "name": "dsh-sql",
-  "version": "0.4.4",
+  "version": "0.4.5",
   "description": "连接 SQLite、MySQL 或 PostgreSQL，查询数据并检查数据库结构。",
   "type": "module",
   "main": "lib/index.js",

@@ -39,6 +39,16 @@ test('SQLite：query(limit) 只迭代前 N 行，不全量载入', async () => {
   assert.deepEqual(capped.rows[0], [1, '张三'])
 })
 
+test('SQLite：64 位整数与重名列不会丢失，空结果也保留列名', async () => {
+  for (const limit of [undefined, 10]) {
+    const result = await adapter.query('SELECT 9223372036854775807 AS id, -9223372036854775808 AS id, 7 AS small', limit)
+    assert.deepEqual(result.columns, ['id', 'id', 'small'])
+    assert.deepEqual(result.rows, [['9223372036854775807', '-9223372036854775808', 7]])
+    assert.doesNotThrow(() => JSON.stringify(result))
+    assert.deepEqual(await adapter.query('SELECT id, name FROM users WHERE 0', limit), { columns: ['id', 'name'], rows: [] })
+  }
+})
+
 test('SQLite：ping 与关闭', async () => {
   await adapter.ping()
   await adapter.close()

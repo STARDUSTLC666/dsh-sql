@@ -64,12 +64,12 @@ function quoteSqliteIdentifier(name: string): string {
   return '"' + name.replace(/"/g, '""') + '"'
 }
 
-function streamMysqlQuery(corePool: { query(querySql: string): any }, sql: string, limit: number, discard: () => void): Promise<QueryResult> {
+function streamMysqlQuery(corePool: { query(querySql: mysql.QueryOptions): any }, sql: string, limit: number, discard: () => void): Promise<QueryResult> {
   return new Promise<QueryResult>((resolve, reject) => {
     let settled = false
     let columns: string[] = []
     const rows: unknown[][] = []
-    const stream = corePool.query(sql).stream({ highWaterMark: 64 })
+    const stream = corePool.query({ sql, rowsAsArray: true }).stream({ highWaterMark: 64 })
     const finish = (): void => {
       if (settled) return
       settled = true
@@ -82,7 +82,7 @@ function streamMysqlQuery(corePool: { query(querySql: string): any }, sql: strin
     stream.on('data', (row: Record<string, unknown>) => {
       if (settled) return
       if (columns.length === 0) columns = Object.keys(row)
-      rows.push(columns.map((name) => toValue(row[name])))
+      rows.push(Array.isArray(row) ? row.map(toValue) : columns.map((name) => toValue(row[name])))
       if (rows.length >= limit) {
         finish()
         stream.destroy()
@@ -106,11 +106,12 @@ function streamPostgresQuery(client: pg.PoolClient, sql: string, limit: number, 
     let settled = false
     let columns: string[] = []
     const rows: unknown[][] = []
-    const query = new pg.Query<Record<string, unknown>>(sql)
+    const queryConfig: pg.QueryArrayConfig = { text: sql, rowMode: 'array' }
+    const query = new pg.Query(queryConfig)
     query.on('row', (row, result) => {
       if (settled) return
       if (columns.length === 0) columns = result?.fields.map((field) => field.name) ?? Object.keys(row)
-      rows.push(columns.map((name) => toValue(row[name])))
+      rows.push(Array.isArray(row) ? row.map(toValue) : columns.map((name) => toValue(row[name])))
       if (rows.length >= limit) {
         // Closing this dedicated connection stops server work and prevents reuse.
         settled = true
@@ -164,16 +165,17 @@ class SqliteAdapter implements DatabaseAdapter {
   async query(sql: string, limit?: number, signal?: AbortSignal) {
     signal?.throwIfAborted()
     const statement = this.db.prepare(sql)
-    if (limit === undefined || limit <= 0) {
-      const rows = statement.all() as Array<Record<string, unknown>>
-      signal?.throwIfAborted()
-      return rowsToColumns(rows)
-    }
+    statement.setReadBigInts(true)
+    statement.setReturnArrays(true)
     const columns = statement.columns().map((column) => column.name)
+    if (limit === undefined || limit <= 0) {
+      const rows = (statement.all() as unknown as unknown[][]).map(row => row.map(toValue))
+      signal?.throwIfAborted()
+      return { columns, rows }
+    }
     const rows: unknown[][] = []
     for (const raw of statement.iterate()) {
-      const row = raw as Record<string, unknown>
-      rows.push(columns.map((name) => toValue(row[name])))
+      rows.push((raw as unknown as unknown[]).map(toValue))
       signal?.throwIfAborted()
       if (rows.length >= limit) break
     }
@@ -214,6 +216,8 @@ class MysqlAdapter implements DatabaseAdapter {
       database: connection.database ?? '',
       connectionLimit: 5,
       enableKeepAlive: true,
+      supportBigNumbers: true,
+      bigNumberStrings: true,
     })
   }
   private async withSignalConnection<T>(signal: AbortSignal | undefined, work: (connection: mysql.PoolConnection, discard: () => void) => Promise<T>): Promise<T> {
@@ -240,9 +244,9 @@ class MysqlAdapter implements DatabaseAdapter {
       if (!destroyed) connection.release()
     }
   }
-  private async queryRows(sql: string, signal?: AbortSignal): Promise<any> {
-    if (signal === undefined) return await this.pool.query(sql)
-    return await this.withSignalConnection(signal, async (connection) => await connection.query(sql))
+  private async queryRows(sql: string | mysql.QueryOptions, signal?: AbortSignal): Promise<any> {
+    if (signal === undefined) return typeof sql === 'string' ? await this.pool.query(sql) : await this.pool.query(sql)
+    return await this.withSignalConnection(signal, async (connection) => typeof sql === 'string' ? await connection.query(sql) : await connection.query(sql))
   }
   async listTables(signal?: AbortSignal) {
     const [rows] = await this.queryRows('SHOW TABLES', signal) as unknown as [Array<Record<string, unknown>>, unknown]
@@ -260,11 +264,12 @@ class MysqlAdapter implements DatabaseAdapter {
   }
   async query(sql: string, limit?: number, signal?: AbortSignal) {
     if (limit === undefined || limit <= 0) {
-      const [rows] = await this.queryRows(sql, signal) as unknown as [Array<Record<string, unknown>>, unknown]
+      const [rows, fields] = await this.queryRows({ sql, rowsAsArray: true }, signal) as [any[], any[]]
+      if (fields?.length) return { columns: fields.map(field => field.name as string), rows: rows.map(row => Array.isArray(row) ? row.map(toValue) : fields.map(field => toValue(row[field.name]))) }
       return rowsToColumns(rows)
     }
     return await this.withSignalConnection(signal, async (connection, discard) => {
-      const coreConnection = (connection as unknown as { connection: { query(querySql: string): any } }).connection
+      const coreConnection = (connection as unknown as { connection: { query(querySql: mysql.QueryOptions): any } }).connection
       return await streamMysqlQuery(coreConnection, sql, limit, discard)
     })
   }
@@ -360,7 +365,8 @@ class PostgresAdapter implements DatabaseAdapter {
   }
   async query(sql: string, limit?: number, signal?: AbortSignal) {
     if (limit === undefined || limit <= 0) {
-      const result = await this.queryWithSignal(sql, undefined, signal)
+      const result = await this.queryWithSignal({ text: sql, rowMode: 'array' }, undefined, signal)
+      if (result.fields?.length) return { columns: result.fields.map((field: { name: string }) => field.name), rows: result.rows.map((row: unknown[]) => row.map(toValue)) }
       const rows = result.rows as Array<Record<string, unknown>>
       return rowsToColumns(rows)
     }

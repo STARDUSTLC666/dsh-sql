@@ -81,6 +81,13 @@ test('execute 返回值可 JSON 序列化', async () => {
   assert.deepEqual(JSON.parse(JSON.stringify(value)), value)
 })
 
+test('JSON 导出遇到同名列时保留列序与所有值', async () => {
+  const result = await query.execute({ sql: 'SELECT 1 AS value, 2 AS value, 9223372036854775807 AS id', format: 'json' })
+  assert.deepEqual(JSON.parse(result.formatted), {
+    columns: ['value', 'value', 'id'], rows: [[1, 2, '9223372036854775807']],
+  })
+})
+
 test('工具执行把 exec.signal 传入数据库适配器', async () => {
   const controller = new AbortController()
   controller.abort(new Error('cancel sql tool'))
