@@ -8,6 +8,8 @@
 
 [![npm](https://img.shields.io/npm/v/dsh-sql)](https://www.npmjs.com/package/dsh-sql) [![downloads](https://raw.githubusercontent.com/STARDUSTLC666/dsh-suite/npm-downloads/assets/dsh-sql-downloads.svg)](https://www.npmjs.com/package/dsh-sql)
 
+欢迎使用，遇到问题或有改进建议，请提交 [issues](https://github.com/STARDUSTLC666/dsh-sql/issues) 和 [PR](https://github.com/STARDUSTLC666/dsh-sql/pulls)。
+
 ## 功能
 
 - 管理连接，查询结构和数据概览。
