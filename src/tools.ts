@@ -62,8 +62,33 @@ function executionSignal(exec: unknown): AbortSignal | undefined {
 /** 只读语句关键字白名单。 */
 const READ_KEYWORDS = /^(select|pragma|explain|show|describe|desc|with)\b/i
 
-/** 去掉字符串、引号标识符与注释，保留真实 SQL 关键字与分号。 */
-function stripSqlNoise(sql: string): string {
+/** 词法校验需要区分的三种引擎。 */
+type SqlEngine = 'sqlite' | 'mysql' | 'postgres'
+
+/**
+ * PostgreSQL 的 E'…' / U&'…' 会把反斜杠当转义；普通 '…' 在
+ * standard_conforming_strings=on（9.1 起的默认值）下反斜杠是普通字符。
+ */
+function isPostgresEscapeString(sql: string, quoteIndex: number): boolean {
+  const prev = sql[quoteIndex - 1]
+  const isWordChar = (ch: string | undefined): boolean => ch !== undefined && /[A-Za-z0-9_$]/.test(ch)
+  if (prev === 'E' || prev === 'e') return !isWordChar(sql[quoteIndex - 2])
+  if (prev === '&') {
+    const u = sql[quoteIndex - 2]
+    return (u === 'U' || u === 'u') && !isWordChar(sql[quoteIndex - 3])
+  }
+  return false
+}
+
+/**
+ * 去掉字符串、引号标识符与注释，保留真实 SQL 关键字与分号。
+ *
+ * 反斜杠规则按引擎对齐，否则去噪结果会和服务器看到的分割方式不一致：
+ * MySQL 默认把 \ 当转义；PostgreSQL 只有 E'…' / U&'…' 才转义；
+ * SQLite 字符串里根本没有反斜杠转义。引号标识符（"…" 与 `…`）在三种
+ * 引擎里都不把反斜杠当转义，永远按字面量处理。
+ */
+function stripSqlNoise(sql: string, engine?: SqlEngine): string {
   let out = ''
   let i = 0
   while (i < sql.length) {
@@ -93,10 +118,11 @@ function stripSqlNoise(sql: string): string {
     if (ch === "'") {
       out += ' '
       i += 1
+      const backslashEscapes = engine === 'mysql' || (engine === 'postgres' && isPostgresEscapeString(sql, i - 1))
       while (i < sql.length) {
         if (sql[i] === "'" && sql[i + 1] === "'") { i += 2; continue }
         if (sql[i] === "'") { i += 1; break }
-        if (sql[i] === '\\') { i += 2; continue }
+        if (backslashEscapes && sql[i] === '\\') { i += 2; continue }
         i += 1
       }
       continue
@@ -106,7 +132,6 @@ function stripSqlNoise(sql: string): string {
       i += 1
       while (i < sql.length) {
         if (sql[i] === ch) { i += 1; break }
-        if (sql[i] === '\\') { i += 2; continue }
         i += 1
       }
       continue
@@ -137,10 +162,76 @@ function stripSqlNoise(sql: string): string {
 /** 写操作关键字：出在 SELECT/EXPLAIN/WITH 语句里即拒绝。 */
 const WRITE_KEYWORDS = /\b(insert|update|delete|replace|merge|drop|alter|create|truncate|call|execute|copy|grant|revoke|attach|detach|vacuum|reindex|refresh|set|reset|begin|commit|rollback|savepoint|release|analyze|load_extension)\b/i
 
-/** 校验只读查询：词法去噪后白名单开头 + 写关键字扫描 + 单语句。 */
-export function assertReadQuery(sql: string): string {
+/** 允许不带参数的只读 PRAGMA（含查询型与会话状态查询）。 */
+const READONLY_PRAGMAS = new Set([
+  'application_id',
+  'auto_vacuum',
+  'cell_size_check',
+  'collation_list',
+  'compile_options',
+  'data_version',
+  'database_list',
+  'encoding',
+  'freelist_count',
+  'function_list',
+  'journal_mode',
+  'legacy_file_format',
+  'mmap_size',
+  'module_list',
+  'page_count',
+  'page_size',
+  'pragma_list',
+  'schema_version',
+  'sqlite_version',
+  'user_version',
+])
+
+/** 允许带一个标识符参数的只读内省 PRAGMA。 */
+const READONLY_PRAGMAS_WITH_ARG = new Set([
+  'foreign_key_check',
+  'foreign_key_list',
+  'index_info',
+  'index_list',
+  'index_xinfo',
+  'integrity_check',
+  'quick_check',
+  'table_info',
+  'table_list',
+  'table_xinfo',
+])
+
+/**
+ * PRAGMA 白名单：只放行只读内省。
+ *
+ * SQLite 里 `PRAGMA name(value)` 与 `PRAGMA name = value` 完全等价，
+ * 只拦改号会让 `PRAGMA foreign_keys(0)` / `PRAGMA writable_schema(1)`
+ * 这类会改连接或库文件状态的调用漏过去，所以按名字白名单放行。
+ */
+function assertReadOnlyPragma(statement: string): void {
+  const match = /^pragma\s+(?:[a-z_][a-z0-9_]*\.)?([a-z_][a-z0-9_]*)\s*(.*)$/i.exec(statement)
+  if (match === null) throw new Error('无法解析这条 PRAGMA，sql_query 只接受只读的 PRAGMA 内省语句。')
+  const pragmaName = match[1].toLowerCase()
+  const rest = match[2].trim()
+  if (rest !== '' && /^[=(]/.test(rest)) {
+    if (!READONLY_PRAGMAS_WITH_ARG.has(pragmaName)) {
+      throw new Error('sql_query 不接受带参数的 PRAGMA ' + pragmaName.toUpperCase() + '（PRAGMA name(value) 与 name=value 等价，会改连接或数据库状态）。请用 sql_exec。')
+    }
+    return
+  }
+  if (!READONLY_PRAGMAS.has(pragmaName) && !READONLY_PRAGMAS_WITH_ARG.has(pragmaName)) {
+    throw new Error('sql_query 只放行只读 PRAGMA 白名单（table_info / index_list / page_count / user_version 等），' + pragmaName.toUpperCase() + ' 不在白名单内。需要修改请用 sql_exec。')
+  }
+}
+
+/**
+ * 校验只读查询：词法去噪后白名单开头 + 写关键字扫描 + 单语句 + PRAGMA 白名单。
+ *
+ * `engine` 决定反斜杠转义规则（见 stripSqlNoise）；不传时按最保守的方式把
+ * 反斜杠当字面量，宁可误拒也不放过第二条语句。
+ */
+export function assertReadQuery(sql: string, engine?: SqlEngine): string {
   const trimmed = sql.trim()
-  const clean = stripSqlNoise(trimmed)
+  const clean = stripSqlNoise(trimmed, engine)
   const first = /^[a-z]+/i.exec(clean.trim())?.[0]?.toLowerCase() ?? ''
   if (!READ_KEYWORDS.test(clean.trim())) {
     throw new Error('sql_query 只接受只读语句（SELECT / PRAGMA / EXPLAIN / SHOW / DESCRIBE / WITH）。写操作请用 sql_exec。')
@@ -149,7 +240,7 @@ export function assertReadQuery(sql: string): string {
   if (statements.length > 1) throw new Error('sql_query 一次只允许一条语句。')
   const single = statements[0]?.trim() ?? ''
   if (first === 'pragma') {
-    if (/=/.test(single)) throw new Error('sql_query 不接受带赋值参数的 PRAGMA 写操作（如 PRAGMA journal_mode=WAL），请用 sql_exec。')
+    assertReadOnlyPragma(single)
   } else if (first === 'show' || first === 'describe' || first === 'desc') {
     // SHOW / DESCRIBE 本身只读，不再扫写关键字（避免误伤 SHOW CREATE TABLE）。
   } else {
@@ -161,6 +252,39 @@ export function assertReadQuery(sql: string): string {
     }
   }
   return trimmed.replace(/;+\s*$/, '').trim()
+}
+
+/**
+ * 把一段写操作脚本压成审批卡可读的摘要。
+ *
+ * 关键点：逐条列出每条语句，并额外给一行语句类型统计。即使脚本体被省略，
+ * 第二条、第 N 条语句的 DROP / DELETE 也不会从审批文本里消失。
+ */
+export function summarizeWriteScript(sql: string): string {
+  const trimmed = sql.trim()
+  const clean = stripSqlNoise(trimmed)
+  const statements = clean
+    .split(';')
+    .map((part) => part.replace(/\s+/g, ' ').trim())
+    .filter((part) => part !== '')
+  const effective = statements.length === 0 ? ['(空语句)'] : statements
+  const tally = new Map<string, number>()
+  for (const statement of effective) {
+    const keyword = /^[a-z]+/i.exec(statement)?.[0]?.toUpperCase() ?? '?'
+    tally.set(keyword, (tally.get(keyword) ?? 0) + 1)
+  }
+  const lines = ['共 ' + effective.length + ' 条语句：']
+  effective.slice(0, 100).forEach((statement, index) => {
+    lines.push('  ' + (index + 1) + '. ' + (statement.length > 120 ? statement.slice(0, 120) + '…' : statement))
+  })
+  if (effective.length > 100) lines.push('  …另有 ' + (effective.length - 100) + ' 条语句')
+  lines.push('语句类型：' + [...tally.entries()].map(([keyword, count]) => keyword + '×' + count).join('，'))
+  if (trimmed.length <= 800) {
+    lines.push('', '完整 SQL：' + trimmed)
+  } else {
+    lines.push('', '完整 SQL 共 ' + trimmed.length + ' 个字符，见本次工具调用参数。')
+  }
+  return lines.join('\n')
 }
 
 const querySchema = {
@@ -311,7 +435,7 @@ export function buildSqlTools(config: ResolvedSqlConfig): { tools: SqlToolDefini
     }
     let adapter = adapters.get(connection.name)
     if (adapter === undefined) {
-      adapter = createAdapter(connection)
+      adapter = createAdapter(connection, { readOnly: cfg.readOnly })
       adapters.set(connection.name, adapter)
     }
     return { adapter, name: connection.name }
@@ -367,7 +491,7 @@ export function buildSqlTools(config: ResolvedSqlConfig): { tools: SqlToolDefini
 
   const sqlQuery: SqlToolDefinition = {
     name: 'sql_query',
-    description: '执行只读 SQL 查询（SELECT / PRAGMA / EXPLAIN / SHOW / DESCRIBE / WITH）。词法级校验会拒绝 data-modifying CTE、SELECT INTO、FOR UPDATE/FOR SHARE、PRAGMA 赋值与多语句。connection 为连接名（缺省第一个连接）。返回列名与行数据，最多 maxRows 行（超出 truncated=true）。写操作请用 sql_exec。',
+    description: '执行只读 SQL 查询（SELECT / PRAGMA / EXPLAIN / SHOW / DESCRIBE / WITH）。词法级校验按引擎处理反斜杠转义，拒绝 data-modifying CTE、SELECT INTO、FOR UPDATE/FOR SHARE、非白名单 PRAGMA 与多语句；readOnly=true 时还会让数据库自身以只读方式连接。connection 为连接名（缺省第一个连接）。返回列名与行数据，最多 maxRows 行（超出 truncated=true）。写操作请用 sql_exec。',
     parameters: compileParameters({
       sql: { type: 'string', required: true, description: '只读 SQL 语句（必填，单条）。' },
       connection: { type: 'string', description: '连接名（可选，缺省第一个连接）。' },
@@ -392,8 +516,9 @@ export function buildSqlTools(config: ResolvedSqlConfig): { tools: SqlToolDefini
     },
     async execute(rawArgs: unknown, exec: unknown) {
       const args = asRecord(rawArgs)
-      const sql = assertReadQuery(requiredString(args, 'sql', 'SQL 语句'))
+      const rawSql = requiredString(args, 'sql', 'SQL 语句')
       const { adapter, name } = getAdapter(optionalString(args, 'connection'))
+      const sql = assertReadQuery(rawSql, adapter.engine)
       const result = await adapter.query(sql, cfg.maxRows + 1, executionSignal(exec))
       const total = result.rows.length
       const rows = result.rows.slice(0, cfg.maxRows)

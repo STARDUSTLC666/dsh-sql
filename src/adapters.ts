@@ -136,12 +136,61 @@ function streamPostgresQuery(client: pg.PoolClient, sql: string, limit: number, 
   })
 }
 
+/** 适配器额外选项：readOnly 时把只读约束下沉到数据库自身。 */
+export interface AdapterOptions {
+  readOnly?: boolean
+}
+
+/** MySQL 连接池配置（导出以便测试断言，不含连接）。 */
+export function mysqlPoolConfig(connection: SqlConnectionConfig): mysql.PoolOptions {
+  return {
+    host: connection.host ?? 'localhost',
+    port: connection.port ?? 3306,
+    user: connection.user ?? '',
+    password: connection.password ?? '',
+    database: connection.database ?? '',
+    connectionLimit: 5,
+    enableKeepAlive: true,
+    supportBigNumbers: true,
+    bigNumberStrings: true,
+    // 显式关掉多语句：即使词法校验被绕过，服务器也不会把第二句当命令执行。
+    multipleStatements: false,
+  }
+}
+
+/**
+ * PostgreSQL 连接池配置。readOnly 时用启动参数把会话默认事务设为只读：
+ * 即使词法校验被绕过（多语句、反斜杠、注释技巧），服务器也会以
+ * "cannot execute ... in a read-only transaction" 拒绝写操作。
+ */
+export function postgresPoolConfig(connection: SqlConnectionConfig, readOnly = false): pg.PoolConfig {
+  const config: pg.PoolConfig = {
+    host: connection.host ?? 'localhost',
+    port: connection.port ?? 5432,
+    user: connection.user ?? '',
+    password: connection.password ?? '',
+    database: connection.database ?? '',
+    max: 5,
+  }
+  if (readOnly) config.options = '-c default_transaction_read_only=on'
+  return config
+}
+
 /** SQLite 适配器（node:sqlite，零依赖）。 */
 class SqliteAdapter implements DatabaseAdapter {
   engine = 'sqlite' as const
   private db: DatabaseSync
-  constructor(file: string) {
-    this.db = new DatabaseSync(file === ':memory:' ? ':memory:' : file)
+  constructor(file: string, readOnly = false) {
+    const memory = file === ':memory:'
+    // 内存库没有落盘风险，也不支持只读打开；文件库在 readOnly 下由 SQLite
+    // 自己拒绝任何写入（PRAGMA 写、DDL、DML 都会报 attempt to write a readonly database）。
+    const options = readOnly && !memory ? { readOnly: true } : {}
+    try {
+      this.db = new DatabaseSync(memory ? ':memory:' : file, options)
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error)
+      throw new Error('无法打开 SQLite 文件 ' + file + '（readOnly=' + readOnly + '）：' + detail)
+    }
     this.db.exec('PRAGMA busy_timeout = 5000')
   }
   async listTables(signal?: AbortSignal) {
@@ -207,18 +256,15 @@ class SqliteAdapter implements DatabaseAdapter {
 class MysqlAdapter implements DatabaseAdapter {
   engine = 'mysql' as const
   private pool: mysql.Pool
-  constructor(connection: SqlConnectionConfig) {
-    this.pool = mysql.createPool({
-      host: connection.host ?? 'localhost',
-      port: connection.port ?? 3306,
-      user: connection.user ?? '',
-      password: connection.password ?? '',
-      database: connection.database ?? '',
-      connectionLimit: 5,
-      enableKeepAlive: true,
-      supportBigNumbers: true,
-      bigNumberStrings: true,
-    })
+  constructor(connection: SqlConnectionConfig, readOnly = false) {
+    this.pool = mysql.createPool(mysqlPoolConfig(connection))
+    if (readOnly) {
+      // 会话级只读：MySQL 5.6.5+ 的 SET SESSION TRANSACTION READ ONLY 会让
+      // 该连接上后续任何 DML/DDL 被服务器拒绝，不依赖词法校验。
+      this.pool.on('connection', (session) => {
+        void session.query('SET SESSION TRANSACTION READ ONLY').catch(() => {})
+      })
+    }
   }
   private async withSignalConnection<T>(signal: AbortSignal | undefined, work: (connection: mysql.PoolConnection, discard: () => void) => Promise<T>): Promise<T> {
     signal?.throwIfAborted()
@@ -289,15 +335,8 @@ class MysqlAdapter implements DatabaseAdapter {
 class PostgresAdapter implements DatabaseAdapter {
   engine = 'postgres' as const
   private pool: pg.Pool
-  constructor(connection: SqlConnectionConfig) {
-    this.pool = new pg.Pool({
-      host: connection.host ?? 'localhost',
-      port: connection.port ?? 5432,
-      user: connection.user ?? '',
-      password: connection.password ?? '',
-      database: connection.database ?? '',
-      max: 5,
-    })
+  constructor(connection: SqlConnectionConfig, readOnly = false) {
+    this.pool = new pg.Pool(postgresPoolConfig(connection, readOnly))
   }
   private async withSignalClient<T>(signal: AbortSignal | undefined, work: (client: pg.PoolClient, discard: () => void) => Promise<T>): Promise<T> {
     signal?.throwIfAborted()
@@ -386,9 +425,10 @@ class PostgresAdapter implements DatabaseAdapter {
   }
 }
 
-/** 按连接配置创建适配器。 */
-export function createAdapter(connection: SqlConnectionConfig): DatabaseAdapter {
-  if (connection.engine === 'sqlite') return new SqliteAdapter(connection.file ?? ':memory:')
-  if (connection.engine === 'mysql') return new MysqlAdapter(connection)
-  return new PostgresAdapter(connection)
+/** 按连接配置创建适配器；readOnly 会下沉到引擎自身的只读约束。 */
+export function createAdapter(connection: SqlConnectionConfig, options: AdapterOptions = {}): DatabaseAdapter {
+  const readOnly = options.readOnly === true
+  if (connection.engine === 'sqlite') return new SqliteAdapter(connection.file ?? ':memory:', readOnly)
+  if (connection.engine === 'mysql') return new MysqlAdapter(connection, readOnly)
+  return new PostgresAdapter(connection, readOnly)
 }

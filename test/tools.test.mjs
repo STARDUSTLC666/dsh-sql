@@ -108,7 +108,8 @@ test('assertReadQuery 拒绝 data-modifying CTE / INTO OUTFILE / 行锁 / PRAGMA
   assert.throws(() => assertReadQuery('WITH gone AS (DELETE FROM t RETURNING *) SELECT * FROM gone'), /DELETE/)
   assert.throws(() => assertReadQuery("SELECT * FROM t INTO OUTFILE '/tmp/x'"), /INTO/)
   assert.throws(() => assertReadQuery('SELECT * FROM t FOR UPDATE'), /FOR UPDATE/)
-  assert.throws(() => assertReadQuery('PRAGMA journal_mode = WAL'), /PRAGMA 写操作/)
+  assert.throws(() => assertReadQuery('PRAGMA journal_mode = WAL'), /不接受带参数的 PRAGMA/)
+  assert.throws(() => assertReadQuery('PRAGMA journal_mode(WAL)'), /不接受带参数的 PRAGMA/)
 })
 
 test('assertReadQuery 连续调用始终拒绝同一 data-modifying CTE', () => {

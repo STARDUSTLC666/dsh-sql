@@ -10,7 +10,7 @@
  */
 
 import { resolveConfig, type SqlConfig } from './config.js'
-import { buildSqlTools, type SqlToolDefinition } from './tools.js'
+import { buildSqlTools, summarizeWriteScript, type SqlToolDefinition } from './tools.js'
 
 /** cordis 服务注入：apply 里要用 ctx.tools，必须显式声明。 */
 export const name = 'sql'
@@ -55,7 +55,9 @@ export function apply(ctx: SqlPluginContext, config?: SqlConfig | null): void {
       const sql = typeof args.sql === 'string' ? args.sql : ''
       return {
         kind: 'ask',
-        reason: 'sql_exec 写操作需要确认：' + sql.slice(0, 200) + (sql.length > 200 ? '…' : ''),
+        // 不截断整段 SQL：先逐条列出每条语句与语句类型统计，再附完整 SQL。
+        // 只截 200 字符会把第二条 DROP / DELETE 挡在审批卡之外。
+        reason: 'sql_exec 写操作需要确认：\n' + summarizeWriteScript(sql),
       }
     })
   }
