@@ -427,12 +427,18 @@ export function buildSqlTools(config: ResolvedSqlConfig): { tools: SqlToolDefini
   const cfg = config
   const adapters = new Map<string, DatabaseAdapter>()
 
-  const getAdapter = (name: string | undefined): { adapter: DatabaseAdapter; name: string } => {
+  /** 只解析连接配置（不建连接），用于在打开数据库前挑选词法规则。 */
+  const findConnection = (name: string | undefined): ResolvedSqlConfig['connections'][number] => {
     const target = name ?? cfg.connections[0].name
     const connection = cfg.connections.find((item) => item.name.toLowerCase() === target.toLowerCase())
     if (connection === undefined) {
       throw new Error('未找到名为 ' + target + ' 的数据库连接。可用 sql_list 查看连接清单。')
     }
+    return connection
+  }
+
+  const getAdapter = (name: string | undefined): { adapter: DatabaseAdapter; name: string } => {
+    const connection = findConnection(name)
     let adapter = adapters.get(connection.name)
     if (adapter === undefined) {
       adapter = createAdapter(connection, { readOnly: cfg.readOnly })
@@ -517,8 +523,10 @@ export function buildSqlTools(config: ResolvedSqlConfig): { tools: SqlToolDefini
     async execute(rawArgs: unknown, exec: unknown) {
       const args = asRecord(rawArgs)
       const rawSql = requiredString(args, 'sql', 'SQL 语句')
-      const { adapter, name } = getAdapter(optionalString(args, 'connection'))
-      const sql = assertReadQuery(rawSql, adapter.engine)
+      const connectionName = optionalString(args, 'connection')
+      // 先按目标连接的引擎做词法校验，再打开数据库：被拒绝的 SQL 不该去建连接或建库文件。
+      const sql = assertReadQuery(rawSql, findConnection(connectionName).engine)
+      const { adapter, name } = getAdapter(connectionName)
       const result = await adapter.query(sql, cfg.maxRows + 1, executionSignal(exec))
       const total = result.rows.length
       const rows = result.rows.slice(0, cfg.maxRows)

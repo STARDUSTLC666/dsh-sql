@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -124,6 +124,15 @@ test('#3 sql_query 在词法层就拦下多语句载荷', async () => {
   await assert.rejects(() => query.execute({ sql: 'PRAGMA writable_schema(1)' }, {}), /PRAGMA/)
   await assert.rejects(() => exec.execute({ sql: 'DELETE FROM users' }, {}), /readOnly=true/)
   for (const adapter of adapters.values()) await adapter.close()
+})
+
+test('#3 被拒的 SQL 不会打开（或新建）数据库文件', async () => {
+  const target = join(dir, 'never-created.db')
+  const cfg = resolveConfig({ connections: [{ name: 'fresh', engine: 'sqlite', file: target }] })
+  const { tools } = buildSqlTools(cfg)
+  const query = tools.find((tool) => tool.name === 'sql_query')
+  await assert.rejects(() => query.execute({ sql: BACKSLASH_PAYLOAD }, {}), /一次只允许一条语句/)
+  assert.equal(existsSync(target), false, '词法校验应发生在打开连接之前')
 })
 
 test('#3 审批摘要逐条列出语句，200 字符后的 DROP 不会被藏起来', async () => {
