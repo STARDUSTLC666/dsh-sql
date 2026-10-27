@@ -1,6 +1,6 @@
 {
   "name": "dsh-sql",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "连接 SQLite、MySQL 或 PostgreSQL，查询数据并检查数据库结构。",
   "type": "module",
   "main": "lib/index.js",
@@ -60,7 +60,7 @@
   "dependencies": {
     "mysql2": "^3.11.0",
     "pg": "^8.13.0",
-    "@stardustlc/dsh-updates": "0.1.1"
+    "@stardustlc/dsh-updates": "0.1.2"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
