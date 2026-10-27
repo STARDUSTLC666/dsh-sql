@@ -1,3 +1,4 @@
+import { registerUpdates } from '@stardustlc/dsh-updates'
 /**
  * dsh-sql —— 工程师级数据库工具插件（node 半身，配置走 cordis.patch.yml）。
  *
@@ -45,6 +46,8 @@ export interface SqlPluginContext {
  * 插件入口：解析配置、构建六工具、给 sql_exec 注入审批门。
  */
 export function apply(ctx: SqlPluginContext, config?: SqlConfig | null): void {
+  registerUpdates(ctx, { name: "dsh-sql" })
+
   const cfg = resolveConfig(config)
 
   const { tools, adapters } = buildSqlTools(cfg)

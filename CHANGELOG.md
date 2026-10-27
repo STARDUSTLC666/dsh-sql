@@ -2,6 +2,12 @@
 
 [返回简介](README.md) · [使用说明](docs/USAGE.md) · [验证记录](docs/VALIDATION.md)
 
+## 0.5.0 (2026-10-26)
+
+- Add this plugin’s own update controls and independent preferences. Automatic installation stays off until explicitly enabled.
+- Confirm manual installs, preserve local sources and disabled state, pause for tasks or unsaved changes, and use native DSH recovery without forced restarts.
+- Require the public DSH 0.2.1-rc.3 update APIs; Suite components remain managed through Suite.
+
 ## 0.4.6 (2026-10-20)
 
 - 修复 sql_query 只读校验与 PostgreSQL 反斜杠语义不一致的问题：词法去噪改为按引擎处理反斜杠（MySQL 默认转义 / PostgreSQL 只有 `E'…'`、`U&'…'` 转义 / SQLite 与引号标识符里都不转义）。`SELECT '\'; DELETE FROM users; --'` 这类双语句载荷会被拒绝，不再能在 readOnly=true 下删表
