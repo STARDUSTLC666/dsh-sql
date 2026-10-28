@@ -423,7 +423,7 @@ export interface SqlExecGateContext {
 }
 
 /** 构建六个工具定义；adapters 惰性创建并按连接名缓存。 */
-export function buildSqlTools(config: ResolvedSqlConfig): { tools: SqlToolDefinition[]; adapters: Map<string, DatabaseAdapter> } {
+export function buildSqlTools(config: ResolvedSqlConfig, policyOf: (execution: unknown) => 'ask' | 'never' | 'unknown' = () => 'unknown'): { tools: SqlToolDefinition[]; adapters: Map<string, DatabaseAdapter> } {
   const cfg = config
   const adapters = new Map<string, DatabaseAdapter>()
 
@@ -689,13 +689,13 @@ export function buildSqlTools(config: ResolvedSqlConfig): { tools: SqlToolDefini
         const rec = asRecord(value)
         const connections = Array.isArray(rec.connections) ? rec.connections : []
         const bad = connections.filter((c) => asRecord(c).ok !== true)
-        const lines = ['dsh-sql 自检' + (bad.length === 0 ? '：全部连接正常。' : '：' + bad.length + ' 个连接异常。')]
+        const lines = ['dsh-sql 自检' + (rec.ok === true ? '：正常。' : '：发现问题。')]
         for (const item of connections) {
           const c = asRecord(item)
           lines.push('- ' + c.name + '（' + c.engine + '）' + (c.ok === true ? ' ✅' : ' ❌ ' + String(c.error ?? '')))
         }
         lines.push('- 只读模式：' + (rec.readOnly === true ? '开（sql_exec 已禁用）' : '关'))
-        lines.push('- 写审批门：' + (rec.writeApproval === true ? '开' : '关'))
+        lines.push('- 写审批门：' + String(rec.writeApprovalDetail ?? (rec.writeApproval === true ? '开' : '关')))
         lines.push('- 行数上限：' + String(rec.maxRows) + '；查询超时 ' + String(rec.queryTimeoutMs) + 'ms；写超时 ' + String(rec.execTimeoutMs) + 'ms')
         return [{ type: 'text', text: lines.join('\n') }]
       },
@@ -703,12 +703,18 @@ export function buildSqlTools(config: ResolvedSqlConfig): { tools: SqlToolDefini
     async execute(_rawArgs: unknown, exec: unknown) {
       const connections = await pingAllConnections(executionSignal(exec))
       const bad = connections.filter((c) => c.ok !== true)
+      const policy = policyOf(exec)
+      const writeApprovalReady = cfg.readOnly || !cfg.writeApproval || policy === 'ask'
+      const writeApprovalDetail = cfg.readOnly ? '只读配置，不允许写入' : !cfg.writeApproval ? '关闭；其它宿主策略仍生效' : policy === 'ask' ? '开启；经宿主询问' : policy === 'never' ? '当前策略 never 无法询问；请切换模式或由用户明确设置 writeApproval=false' : '无法读取宿主审批策略'
       return {
-        ok: bad.length === 0,
+        ok: bad.length === 0 && writeApprovalReady,
         plugin: 'dsh-sql',
         connections,
         readOnly: cfg.readOnly,
         writeApproval: cfg.writeApproval,
+        approvalPolicy: policy,
+        writeApprovalReady,
+        writeApprovalDetail,
         maxRows: cfg.maxRows,
         queryTimeoutMs: cfg.queryTimeoutMs,
         execTimeoutMs: cfg.execTimeoutMs,

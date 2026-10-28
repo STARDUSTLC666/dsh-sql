@@ -10,6 +10,7 @@
  */
 import { type SqlConfig } from './config.js';
 import { type SqlToolDefinition } from './tools.js';
+import { type ApprovalContext } from './approval.js';
 /** cordis 服务注入：apply 里要用 ctx.tools，必须显式声明。 */
 export declare const name = "sql";
 export declare const inject: string[];
@@ -31,7 +32,7 @@ interface SqlToolExecution {
 /** Harness `tools/pre-execute` waterfall 监听器。 */
 type SqlPreExecuteListener = (exec: SqlToolExecution, next: () => Promise<SqlPreToolDecision>) => Promise<SqlPreToolDecision>;
 /** 插件所需的最小 ctx 面。 */
-export interface SqlPluginContext {
+export interface SqlPluginContext extends ApprovalContext {
     tools: {
         register(definition: SqlToolDefinition): () => void;
     };

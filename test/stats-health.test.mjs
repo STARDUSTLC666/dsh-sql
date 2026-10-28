@@ -8,7 +8,7 @@ import { buildSqlTools, resolveConfig, toCsv } from '../lib/index.js'
 function makeTools() {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-sql-stats-'))
   const cfg = resolveConfig({ connections: [{ name: 'local', engine: 'sqlite', file: join(dir, 'stats.db') }], maxRows: 100 })
-  const { tools } = buildSqlTools(cfg)
+  const { tools } = buildSqlTools(cfg, () => 'ask')
   const exec = tools.find((t) => t.name === 'sql_exec')
   return { tools, exec }
 }
@@ -82,7 +82,7 @@ test('sql_health：连接正常时 ok=true 且汇总安全配置', async () => {
   assert.equal(value.writeApproval, true)
   assert.equal(typeof value.maxRows, 'number')
   const blocks = health.output.render({}, value)
-  assert.match(blocks[0].text, /自检：全部连接正常/)
+  assert.match(blocks[0].text, /自检：正常/)
 })
 
 test('sql_health：坏连接报 ok=false 且错误可读', async () => {

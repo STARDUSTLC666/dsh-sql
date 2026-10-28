@@ -143,6 +143,7 @@ test('#3 审批摘要逐条列出语句，200 字符后的 DROP 不会被藏起�
   assert.match(summary, /语句类型：UPDATE×1，DROP×1/)
 
   const { ctx, listeners } = makeFakeCtx()
+  ctx.get = name => name === 'approval' ? { config: { policy: 'ask' } } : undefined
   apply(ctx, { writeApproval: true })
   const reason = await listeners['tools/pre-execute'][0]({ name: 'sql_exec', arguments: { sql } }, async () => ({ kind: 'allow' }))
   assert.equal(reason.kind, 'ask')

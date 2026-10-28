@@ -12,6 +12,7 @@ import { registerUpdates } from '@stardustlc/dsh-updates'
 
 import { resolveConfig, type SqlConfig } from './config.js'
 import { buildSqlTools, summarizeWriteScript, type SqlToolDefinition } from './tools.js'
+import { approvalPolicy, approvalProblem, type ApprovalContext } from './approval.js'
 
 /** cordis 服务注入：apply 里要用 ctx.tools，必须显式声明。 */
 export const name = 'sql'
@@ -36,7 +37,7 @@ type SqlPreExecuteListener = (
 ) => Promise<SqlPreToolDecision>
 
 /** 插件所需的最小 ctx 面。 */
-export interface SqlPluginContext {
+export interface SqlPluginContext extends ApprovalContext {
   tools: { register(definition: SqlToolDefinition): () => void }
   on(event: 'tools/pre-execute', listener: SqlPreExecuteListener): () => void
   on(event: 'dispose', listener: () => void): () => void
@@ -50,10 +51,16 @@ export function apply(ctx: SqlPluginContext, config?: SqlConfig | null): void {
 
   const cfg = resolveConfig(config)
 
-  const { tools, adapters } = buildSqlTools(cfg)
+  const policyOf = (exec: unknown) => approvalPolicy(ctx, exec)
+  const { tools, adapters } = buildSqlTools(cfg, policyOf)
   if (cfg.writeApproval) {
     ctx.on('tools/pre-execute', async (exec, next) => {
       if (exec.name !== 'sql_exec') return next()
+      const downstream = await next()
+      if (downstream.kind === 'deny') return downstream
+      if (cfg.readOnly) return { kind: 'deny', reason: '当前连接为只读配置，sql_exec 已禁用 / Read-only configuration; sql_exec is disabled.' }
+      const problem = approvalProblem(policyOf(exec), 'writeApproval')
+      if (problem) return { kind: 'deny', reason: problem }
       const args = (typeof exec.arguments === 'object' && exec.arguments !== null ? exec.arguments : {}) as Record<string, unknown>
       const sql = typeof args.sql === 'string' ? args.sql : ''
       return {

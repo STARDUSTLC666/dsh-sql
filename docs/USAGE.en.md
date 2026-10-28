@@ -1,5 +1,9 @@
 # dsh-sql usage guide
 
+## Confirmation in Full Access
+
+The plugin keeps its confirmation requirement. With approval policy `never`, it reports that confirmation is unavailable and performs no write. Switch to a mode that can ask, or explicitly set `writeApproval: false` yourself. Host denials still apply.
+
 [Overview](../README.en.md) · [Changelog](../CHANGELOG.md) · [Validation](VALIDATION.md)
 
 ## Current improvements

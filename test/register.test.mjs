@@ -6,6 +6,7 @@ function makeFakeCtx() {
   const registered = []
   const listeners = {}
   const ctx = {
+    get(name) { return name === 'approval' ? { config: { policy: 'ask' } } : undefined },
     tools: {
       register(definition, ...extra) {
         registered.push({ definition, extra })
@@ -46,7 +47,7 @@ test('sql_exec 通过 tools/pre-execute 返回 ask，其他工具继续 waterfal
   )
   assert.equal(ask.kind, 'ask')
   assert.ok(ask.reason.includes('DELETE FROM users'))
-  assert.equal(delegated, false)
+  assert.equal(delegated, true)
 
   const allowed = await preExecute(
     { name: 'sql_query', arguments: { sql: 'SELECT 1' } },
