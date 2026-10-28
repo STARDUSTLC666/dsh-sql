@@ -4,7 +4,7 @@
 
 ![dsh-sql whale girl plugin cover](https://raw.githubusercontent.com/STARDUSTLC666/dsh-sql/master/assets/cover-whale-girl.png)
 
-Connect SQLite, MySQL or PostgreSQL to query data and inspect schemas.
+Connect SQLite, MySQL or PostgreSQL to query data and inspect schemas and statistics from DSH. Includes read-only protection, result and timeout limits, configurable write confirmation and separate connection and permission checks.
 
 [![npm](https://img.shields.io/npm/v/dsh-sql)](https://www.npmjs.com/package/dsh-sql) [![downloads](https://raw.githubusercontent.com/STARDUSTLC666/dsh-suite/npm-downloads/assets/dsh-sql-downloads.svg)](https://www.npmjs.com/package/dsh-sql)
 

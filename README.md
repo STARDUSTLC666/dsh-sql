@@ -4,7 +4,7 @@
 
 ![dsh-sql 鲸鱼娘插件封面](https://raw.githubusercontent.com/STARDUSTLC666/dsh-sql/master/assets/cover-whale-girl.png)
 
-连接 SQLite、MySQL 或 PostgreSQL，查询数据并检查数据库结构。
+连接 SQLite、MySQL 或 PostgreSQL，在 DSH 中查询数据、查看表结构与统计。提供只读保护、结果与超时限制、可配置的写操作确认，并分别报告连接和权限状态。
 
 [![npm](https://img.shields.io/npm/v/dsh-sql)](https://www.npmjs.com/package/dsh-sql) [![downloads](https://raw.githubusercontent.com/STARDUSTLC666/dsh-suite/npm-downloads/assets/dsh-sql-downloads.svg)](https://www.npmjs.com/package/dsh-sql)
 
