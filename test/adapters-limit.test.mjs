@@ -4,14 +4,20 @@ import MysqlQuery from '../node_modules/mysql2/lib/commands/query.js'
 import pg from 'pg'
 import { createAdapter } from '../lib/index.js'
 
-function pgFixture(values, { fail = false, stall = false, columns = ['a'] } = {}) {
+function pgFixture(values, { fail = false, stall = false, columns = ['a'], failControl } = {}) {
   const adapter = createAdapter({ name: 'pg', engine: 'postgres', database: 'app' })
-  const state = { released: [], produced: 0, query: undefined }
+  const state = { released: [], produced: 0, query: undefined, commands: [] }
   adapter.pool = {
     async connect() {
       return {
         release(force) { state.released.push(force === true) },
         query(query) {
+          state.commands.push(typeof query === 'string' ? query : query.text)
+          if (typeof query === 'string') {
+            assert.ok(['BEGIN READ ONLY', 'ROLLBACK'].includes(query))
+            return query === failControl ? Promise.reject(new Error('control failed: ' + query)) : Promise.resolve({})
+          }
+          if (!(query instanceof pg.Query)) return Promise.resolve({ fields: columns.map(name => ({ name })), rows: values.map(value => Array.isArray(value) ? value : [value]) })
           assert.ok(query instanceof pg.Query)
           state.query = query
           queueMicrotask(() => {
@@ -41,18 +47,29 @@ test('PostgreSQL：真实 pg.Query 行事件在上限结束，内部不累计结
   assert.equal(state.produced, 3)
   assert.deepEqual(state.released, [true])
   assert.deepEqual(state.query._result.rows, [])
+  assert.equal(state.query.requiresPreparation(), true, 'extended protocol must reject multiple commands')
+  assert.deepEqual(state.commands, ['BEGIN READ ONLY', 'SELECT a FROM t ORDER BY a'])
 })
 
-function mysqlFixture(values, { fail = false, stall = false, columns = ['a'] } = {}) {
+function mysqlFixture(values, { fail = false, stall = false, columns = ['a'], failControl } = {}) {
   const adapter = createAdapter({ name: 'my', engine: 'mysql', database: 'app' })
-  const state = { destroyed: false, released: false, produced: 0 }
+  const state = { destroyed: false, released: false, produced: 0, commands: [] }
   adapter.pool = {
     async getConnection() {
       return {
         destroy() { state.destroyed = true },
         release() { state.released = true },
+        query(query) {
+          state.commands.push(typeof query === 'string' ? query : query.sql)
+          if (typeof query === 'string') {
+            assert.ok(['START TRANSACTION READ ONLY', 'ROLLBACK'].includes(query))
+            return query === failControl ? Promise.reject(new Error('control failed: ' + query)) : Promise.resolve([[], []])
+          }
+          return Promise.resolve([values.map(value => Array.isArray(value) ? value : [value]), columns.map(name => ({ name }))])
+        },
         connection: {
           query(sql) {
+            state.commands.push(sql.sql)
             const query = new MysqlQuery({ sql })
             let paused = false
             let ended = false
@@ -161,7 +178,10 @@ test('MySQL / PostgreSQL：已取消的有界查询不请求连接', async () =>
 test('查询结果 bigint：安全整数转 number，超出安全范围转十进制字符串', async () => {
   const adapter = createAdapter({ name: 'my', engine: 'mysql', database: 'app' })
   adapter.pool = {
-    async query(sql) {
+    async getConnection() { return {
+      release() {}, destroy() {},
+      async query(sql) {
+      if (typeof sql === 'string') return [[], []]
       assert.equal(sql.sql, 'SELECT safe, too_large, too_small FROM t')
       assert.equal(sql.rowsAsArray, true)
       return [[{
@@ -169,7 +189,8 @@ test('查询结果 bigint：安全整数转 number，超出安全范围转十进
         too_large: 9007199254740993n,
         too_small: -9007199254740993n,
       }], []]
-    },
+      },
+    } },
   }
 
   const result = await adapter.query('SELECT safe, too_large, too_small FROM t')
@@ -217,4 +238,40 @@ test('PostgreSQL：取消信号销毁专用连接', async () => {
   controller.abort(new Error('cancel postgres'))
   await assert.rejects(pending, /cancel postgres/)
   assert.equal(forcedRelease, true)
+})
+
+test('MySQL / PostgreSQL：查询独立只读，成功或查询错误后回滚，再归还连接', async () => {
+  for (const makeFixture of [mysqlFixture, pgFixture]) {
+    for (const limit of [undefined, 10]) {
+      const { adapter, state } = makeFixture([1])
+      assert.deepEqual((await adapter.query('SELECT a FROM t', limit)).rows, [[1]])
+      assert.deepEqual(state.commands, [makeFixture === mysqlFixture ? 'START TRANSACTION READ ONLY' : 'BEGIN READ ONLY', 'SELECT a FROM t', 'ROLLBACK'])
+    }
+    const { adapter, state } = makeFixture([], { fail: true })
+    await assert.rejects(adapter.query('SELECT broken', 10), /query failed/)
+    assert.equal(state.commands.at(-1), 'ROLLBACK')
+  }
+})
+
+test('MySQL / PostgreSQL：只读事务建立失败时不运行用户查询，回滚失败时销毁连接', async () => {
+  for (const makeFixture of [mysqlFixture, pgFixture]) {
+    const begin = makeFixture === mysqlFixture ? 'START TRANSACTION READ ONLY' : 'BEGIN READ ONLY'
+    const setup = makeFixture([1], { failControl: begin })
+    await assert.rejects(setup.adapter.query('SELECT a FROM t', 10), /control failed/)
+    assert.deepEqual(setup.state.commands, [begin, 'ROLLBACK'])
+    const cleanup = makeFixture([1], { failControl: 'ROLLBACK' })
+    await assert.rejects(cleanup.adapter.query('SELECT a FROM t', 10), /control failed/)
+    if (makeFixture === mysqlFixture) {
+      assert.equal(cleanup.state.destroyed, true)
+      assert.equal(cleanup.state.released, false)
+    } else assert.deepEqual(cleanup.state.released, [true])
+  }
+})
+
+test('MySQL / PostgreSQL：readOnly 适配器直接调用 exec 也不会建立写连接', async () => {
+  for (const engine of ['mysql', 'postgres']) {
+    const adapter = createAdapter({ name: 'ro', engine }, { readOnly: true })
+    adapter.pool = { query() { assert.fail('must not query') }, connect() { assert.fail('must not connect') }, getConnection() { assert.fail('must not acquire') } }
+    await assert.rejects(adapter.exec('DELETE FROM t'), /readOnly=true/)
+  }
 })

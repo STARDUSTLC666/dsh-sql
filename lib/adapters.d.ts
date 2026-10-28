@@ -30,9 +30,8 @@ export interface AdapterOptions {
 /** MySQL 连接池配置（导出以便测试断言，不含连接）。 */
 export declare function mysqlPoolConfig(connection: SqlConnectionConfig): mysql.PoolOptions;
 /**
- * PostgreSQL 连接池配置。readOnly 时用启动参数把会话默认事务设为只读：
- * 即使词法校验被绕过（多语句、反斜杠、注释技巧），服务器也会以
- * "cannot execute ... in a read-only transaction" 拒绝写操作。
+ * PostgreSQL 连接池配置。启动参数仅作为默认值；用户查询还必须使用
+ * 独立只读事务，不能依赖可被 set_config 修改的会话默认设置。
  */
 export declare function postgresPoolConfig(connection: SqlConnectionConfig, readOnly?: boolean): pg.PoolConfig;
 /** 按连接配置创建适配器；readOnly 会下沉到引擎自身的只读约束。 */

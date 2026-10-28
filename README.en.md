@@ -13,7 +13,7 @@ Feedback and contributions are welcome: report [issues](https://github.com/STARD
 ## What it does
 
 - Manage connections and inspect schemas or database summaries.
-- Limit rows and timeouts for read-only queries.
+- Limit rows and timeouts for read-only queries; MySQL / PostgreSQL enforce a separate read-only transaction for each query.
 - Keep writes under host approval and check connections.
 
 ## Install

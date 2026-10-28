@@ -106,7 +106,8 @@ function streamPostgresQuery(client: pg.PoolClient, sql: string, limit: number, 
     let settled = false
     let columns: string[] = []
     const rows: unknown[][] = []
-    const queryConfig: pg.QueryArrayConfig = { text: sql, rowMode: 'array' }
+    // The extended protocol rejects multiple commands in a single Parse message.
+    const queryConfig: pg.QueryArrayConfig & { queryMode: 'extended' } = { text: sql, rowMode: 'array', queryMode: 'extended' }
     const query = new pg.Query(queryConfig)
     query.on('row', (row, result) => {
       if (settled) return
@@ -159,9 +160,8 @@ export function mysqlPoolConfig(connection: SqlConnectionConfig): mysql.PoolOpti
 }
 
 /**
- * PostgreSQL 连接池配置。readOnly 时用启动参数把会话默认事务设为只读：
- * 即使词法校验被绕过（多语句、反斜杠、注释技巧），服务器也会以
- * "cannot execute ... in a read-only transaction" 拒绝写操作。
+ * PostgreSQL 连接池配置。启动参数仅作为默认值；用户查询还必须使用
+ * 独立只读事务，不能依赖可被 set_config 修改的会话默认设置。
  */
 export function postgresPoolConfig(connection: SqlConnectionConfig, readOnly = false): pg.PoolConfig {
   const config: pg.PoolConfig = {
@@ -256,17 +256,10 @@ class SqliteAdapter implements DatabaseAdapter {
 class MysqlAdapter implements DatabaseAdapter {
   engine = 'mysql' as const
   private pool: mysql.Pool
-  constructor(connection: SqlConnectionConfig, readOnly = false) {
+  constructor(connection: SqlConnectionConfig, private readOnly = false) {
     this.pool = mysql.createPool(mysqlPoolConfig(connection))
-    if (readOnly) {
-      // 会话级只读：MySQL 5.6.5+ 的 SET SESSION TRANSACTION READ ONLY 会让
-      // 该连接上后续任何 DML/DDL 被服务器拒绝，不依赖词法校验。
-      this.pool.on('connection', (session) => {
-        void session.query('SET SESSION TRANSACTION READ ONLY').catch(() => {})
-      })
-    }
   }
-  private async withSignalConnection<T>(signal: AbortSignal | undefined, work: (connection: mysql.PoolConnection, discard: () => void) => Promise<T>): Promise<T> {
+  private async withSignalConnection<T>(signal: AbortSignal | undefined, work: (connection: mysql.PoolConnection, discard: () => void, isDiscarded: () => boolean) => Promise<T>): Promise<T> {
     signal?.throwIfAborted()
     const connection = await this.pool.getConnection()
     let destroyed = false
@@ -284,11 +277,24 @@ class MysqlAdapter implements DatabaseAdapter {
     signal?.addEventListener('abort', onAbort, { once: true })
     try {
       signal?.throwIfAborted()
-      return await Promise.race([work(connection, discard), aborted])
+      return await Promise.race([work(connection, discard, () => destroyed), aborted])
     } finally {
       signal?.removeEventListener('abort', onAbort)
       if (!destroyed) connection.release()
     }
+  }
+  private async withReadOnlyConnection<T>(signal: AbortSignal | undefined, work: (connection: mysql.PoolConnection, discard: () => void) => Promise<T>): Promise<T> {
+    return await this.withSignalConnection(signal, async (connection, discard, isDiscarded) => {
+      try {
+        // Await setup and fail closed; never silently ignore an unsupported mode.
+        await connection.query('START TRANSACTION READ ONLY')
+        return await work(connection, discard)
+      } finally {
+        if (!isDiscarded()) {
+          try { await connection.query('ROLLBACK') } catch (error) { discard(); throw error }
+        }
+      }
+    })
   }
   private async queryRows(sql: string | mysql.QueryOptions, signal?: AbortSignal): Promise<any> {
     if (signal === undefined) return typeof sql === 'string' ? await this.pool.query(sql) : await this.pool.query(sql)
@@ -309,17 +315,18 @@ class MysqlAdapter implements DatabaseAdapter {
     }))
   }
   async query(sql: string, limit?: number, signal?: AbortSignal) {
-    if (limit === undefined || limit <= 0) {
-      const [rows, fields] = await this.queryRows({ sql, rowsAsArray: true }, signal) as [any[], any[]]
-      if (fields?.length) return { columns: fields.map(field => field.name as string), rows: rows.map(row => Array.isArray(row) ? row.map(toValue) : fields.map(field => toValue(row[field.name]))) }
-      return rowsToColumns(rows)
-    }
-    return await this.withSignalConnection(signal, async (connection, discard) => {
+    return await this.withReadOnlyConnection(signal, async (connection, discard) => {
+      if (limit === undefined || limit <= 0) {
+        const [rows, fields] = await connection.query({ sql, rowsAsArray: true }) as [any[], any[]]
+        if (fields?.length) return { columns: fields.map(field => field.name as string), rows: rows.map(row => Array.isArray(row) ? row.map(toValue) : fields.map(field => toValue(row[field.name]))) }
+        return rowsToColumns(rows)
+      }
       const coreConnection = (connection as unknown as { connection: { query(querySql: mysql.QueryOptions): any } }).connection
       return await streamMysqlQuery(coreConnection, sql, limit, discard)
     })
   }
   async exec(sql: string, signal?: AbortSignal) {
+    if (this.readOnly) throw new Error('当前配置 readOnly=true，禁止写入数据库。')
     const [result] = await this.queryRows(sql, signal) as unknown as [{ affectedRows?: number }, unknown]
     return Number(result?.affectedRows ?? 0)
   }
@@ -335,10 +342,10 @@ class MysqlAdapter implements DatabaseAdapter {
 class PostgresAdapter implements DatabaseAdapter {
   engine = 'postgres' as const
   private pool: pg.Pool
-  constructor(connection: SqlConnectionConfig, readOnly = false) {
+  constructor(connection: SqlConnectionConfig, private readOnly = false) {
     this.pool = new pg.Pool(postgresPoolConfig(connection, readOnly))
   }
-  private async withSignalClient<T>(signal: AbortSignal | undefined, work: (client: pg.PoolClient, discard: () => void) => Promise<T>): Promise<T> {
+  private async withSignalClient<T>(signal: AbortSignal | undefined, work: (client: pg.PoolClient, discard: () => void, isDiscarded: () => boolean) => Promise<T>): Promise<T> {
     signal?.throwIfAborted()
     const client = await this.pool.connect()
     let destroyed = false
@@ -356,11 +363,25 @@ class PostgresAdapter implements DatabaseAdapter {
     signal?.addEventListener('abort', onAbort, { once: true })
     try {
       signal?.throwIfAborted()
-      return await Promise.race([work(client, discard), aborted])
+      return await Promise.race([work(client, discard, () => destroyed), aborted])
     } finally {
       signal?.removeEventListener('abort', onAbort)
       if (!destroyed) client.release()
     }
+  }
+  private async withReadOnlyClient<T>(signal: AbortSignal | undefined, work: (client: pg.PoolClient, discard: () => void) => Promise<T>): Promise<T> {
+    return await this.withSignalClient(signal, async (client, discard, isDiscarded) => {
+      try {
+        await client.query('BEGIN READ ONLY')
+        return await work(client, discard)
+      } finally {
+        // Rollback also reverts set_config(..., false). A capped/cancelled query
+        // destroys its connection instead, causing server-side rollback.
+        if (!isDiscarded()) {
+          try { await client.query('ROLLBACK') } catch (error) { discard(); throw error }
+        }
+      }
+    })
   }
   private async queryWithSignal(query: any, values: unknown[] | undefined, signal?: AbortSignal): Promise<any> {
     const run = async (client: { query(query: any, values?: unknown[]): Promise<any> }): Promise<any> => {
@@ -403,17 +424,17 @@ class PostgresAdapter implements DatabaseAdapter {
     }))
   }
   async query(sql: string, limit?: number, signal?: AbortSignal) {
-    if (limit === undefined || limit <= 0) {
-      const result = await this.queryWithSignal({ text: sql, rowMode: 'array' }, undefined, signal)
-      if (result.fields?.length) return { columns: result.fields.map((field: { name: string }) => field.name), rows: result.rows.map((row: unknown[]) => row.map(toValue)) }
-      const rows = result.rows as Array<Record<string, unknown>>
-      return rowsToColumns(rows)
-    }
-    return await this.withSignalClient(signal, async (client, discard) => {
+    return await this.withReadOnlyClient(signal, async (client, discard) => {
+      if (limit === undefined || limit <= 0) {
+        const queryConfig: pg.QueryArrayConfig & { queryMode: 'extended' } = { text: sql, rowMode: 'array', queryMode: 'extended' }
+        const result = await client.query(queryConfig)
+        return { columns: result.fields.map((field: { name: string }) => field.name), rows: result.rows.map((row: unknown[]) => row.map(toValue)) }
+      }
       return await streamPostgresQuery(client, sql, limit, discard)
     })
   }
   async exec(sql: string, signal?: AbortSignal) {
+    if (this.readOnly) throw new Error('当前配置 readOnly=true，禁止写入数据库。')
     const result = await this.queryWithSignal(sql, undefined, signal)
     return Number(result.rowCount ?? 0)
   }

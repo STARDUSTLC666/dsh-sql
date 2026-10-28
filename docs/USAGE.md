@@ -77,7 +77,8 @@ sql_exec { sql: UPDATE orders SET status = 'paid' WHERE id = 42 }
 
 - **词法级只读保护**：sql_query 先剥离字符串/注释再校验，拒绝 data-modifying CTE（WITH…DELETE/UPDATE）、SELECT INTO、FOR UPDATE/FOR SHARE、多语句，以及不在只读白名单里的 PRAGMA。去噪按引擎处理反斜杠（MySQL 默认转义、PostgreSQL 只有 `E'…'`/`U&'…'` 转义、SQLite 与引号标识符里都不转义），避免「校验看到一条、服务器执行两条」
 - **写审批门**：sql_exec 默认弹审批（对齐 dsh-email 的发信审批），headless 环境无审批通道时拒绝执行
-- **readOnly 模式**：生产库可整体禁用写。除了禁用 sql_exec，还会把只读约束下沉到数据库自身：SQLite 以只读方式打开文件，PostgreSQL 用 `-c default_transaction_read_only=on` 启动参数，MySQL 在每个新连接上执行 `SET SESSION TRANSACTION READ ONLY`（需要 MySQL 5.6.5+ / MariaDB 10.0+）。即使词法校验被绕过，服务器也会拒绝写入
+- **查询事务**：MySQL / PostgreSQL 的 `sql_query` 每次在独立只读事务中运行，完成或报错后回滚，达到行数上限或取消时销毁专用连接。PostgreSQL 查询采用扩展协议，服务器拒绝同一请求内的多条命令；`set_config` 对默认设置的修改随回滚撤销。MySQL 必须成功执行 `START TRANSACTION READ ONLY`，不支持或设置失败时拒绝运行查询。即使允许审批写入，这些查询约束仍然生效。
+- **readOnly 模式**：生产库可整体禁用 `sql_exec`。SQLite 文件以只读方式打开；PostgreSQL 还保留只读启动默认值。建议使用仅授予所需读取权限的数据库账号；事务只读不等同于数据库账号、文件系统或外部函数的权限隔离。
 - **审批卡不藏语句**：sql_exec 的审批文本逐条列出每条语句，并给出一行语句类型统计；超过 800 字符时把完整 SQL 指回工具参数，第二条 DROP / DELETE 不会因为截断而从审批卡里消失
 - **流式行数钳制**：SQLite 迭代器 / MySQL Readable / PostgreSQL Query 行事件最多收集 maxRows+1 行，超量标记 truncated；MySQL 和 PostgreSQL 在达到上限时关闭该查询的专用连接，未达上限则正常归还连接池，避免全量结果驻留内存
 - **可取消执行**：查询与写操作遵守 Harness 的 `exec.signal`；取消时会中止等待并销毁正在工作的 MySQL/PostgreSQL 专用连接

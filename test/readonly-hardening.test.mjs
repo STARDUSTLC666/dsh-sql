@@ -90,7 +90,7 @@ test('#3 只读 PRAGMA 内省仍然可用', () => {
   }
 })
 
-test('#3 readOnly 时 PostgreSQL 连接用启动参数强制会话只读', () => {
+test('#3 readOnly 时 PostgreSQL 连接保留只读启动默认值', () => {
   const connection = { name: 'pg', engine: 'postgres', host: 'h', database: 'd', user: 'u' }
   assert.equal(postgresPoolConfig(connection, false).options, undefined)
   assert.equal(postgresPoolConfig(connection, true).options, '-c default_transaction_read_only=on')
