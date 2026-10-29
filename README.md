@@ -6,7 +6,9 @@
 
 连接 SQLite、MySQL 或 PostgreSQL，在 DSH 中查询数据、查看表结构与统计。提供只读保护、结果与超时限制、可配置的写操作确认，并分别报告连接和权限状态。
 
-[![npm](https://img.shields.io/npm/v/dsh-sql)](https://www.npmjs.com/package/dsh-sql) [![downloads](https://raw.githubusercontent.com/STARDUSTLC666/dsh-suite/npm-downloads/assets/dsh-sql-downloads.svg)](https://www.npmjs.com/package/dsh-sql)
+[![npm](https://img.shields.io/npm/v/dsh-sql)](https://www.npmjs.com/package/dsh-sql) [![downloads](https://raw.githubusercontent.com/STARDUSTLC666/dsh-suite/npm-downloads/assets/dsh-sql-downloads.svg)](https://www.npmjs.com/package/dsh-sql) [![total downloads](https://raw.githubusercontent.com/STARDUSTLC666/dsh-suite/npm-downloads/assets/dsh-sql-total-downloads.svg)](https://www.npmjs.com/package/dsh-sql)
+
+[下载统计说明](https://github.com/STARDUSTLC666/dsh-suite/blob/npm-downloads/README.md)
 
 欢迎使用，遇到问题或有改进建议，请提交 [issues](https://github.com/STARDUSTLC666/dsh-sql/issues) 和 [PR](https://github.com/STARDUSTLC666/dsh-sql/pulls)。
 
@@ -28,7 +30,10 @@ dsh plugin --profile desktop add dsh-sql
 
 ## 开始使用
 
-配置数据库连接后，可说：“查看这张表的结构和最近十条记录，先只读查询。”
+1. 在插件设置中添加自己的 SQLite、MySQL 或 PostgreSQL 连接，确认目标数据库。
+2. 先让助手读取表结构，再用只读查询检查少量记录。
+3. 明确查询条件与结果上限，核对返回列、行数和是否被截断。
+4. 确需写入时才启用相应权限，先核对 SQL 和连接再确认；完成后重新查询验证。
 
 ## 依赖与配置
 

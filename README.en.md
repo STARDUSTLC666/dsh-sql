@@ -6,7 +6,9 @@
 
 Connect SQLite, MySQL or PostgreSQL to query data and inspect schemas and statistics from DSH. Includes read-only protection, result and timeout limits, configurable write confirmation and separate connection and permission checks.
 
-[![npm](https://img.shields.io/npm/v/dsh-sql)](https://www.npmjs.com/package/dsh-sql) [![downloads](https://raw.githubusercontent.com/STARDUSTLC666/dsh-suite/npm-downloads/assets/dsh-sql-downloads.svg)](https://www.npmjs.com/package/dsh-sql)
+[![npm](https://img.shields.io/npm/v/dsh-sql)](https://www.npmjs.com/package/dsh-sql) [![downloads](https://raw.githubusercontent.com/STARDUSTLC666/dsh-suite/npm-downloads/assets/dsh-sql-downloads.svg)](https://www.npmjs.com/package/dsh-sql) [![total downloads](https://raw.githubusercontent.com/STARDUSTLC666/dsh-suite/npm-downloads/assets/dsh-sql-total-downloads.svg)](https://www.npmjs.com/package/dsh-sql)
+
+[Download statistics](https://github.com/STARDUSTLC666/dsh-suite/blob/npm-downloads/README.md)
 
 Feedback and contributions are welcome: report [issues](https://github.com/STARDUSTLC666/dsh-sql/issues) or submit [pull requests](https://github.com/STARDUSTLC666/dsh-sql/pulls).
 
@@ -28,7 +30,10 @@ For the web version, replace `desktop` with `web`. Restart DSH after installatio
 
 ## Start using it
 
-Configure a connection, then ask to inspect a table schema and its ten latest rows using read-only queries.
+1. Add your SQLite, MySQL or PostgreSQL connection in plugin settings and confirm the database.
+2. Inspect the schema first, then query a small set of rows in read-only mode.
+3. Specify filters and result limits; check columns, row counts and truncation.
+4. Enable write access only when needed, review the SQL and connection before confirming, and query again to verify.
 
 ## Requirements and configuration
 

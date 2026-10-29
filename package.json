@@ -1,6 +1,6 @@
 {
   "name": "dsh-sql",
-  "version": "0.5.6",
+  "version": "0.5.7",
   "description": "DSH 数据库工具：SQLite / MySQL / PostgreSQL 查询、结构与统计、只读保护和写操作确认。欢迎提交 issues 和 PR。",
   "type": "module",
   "main": "lib/index.js",
