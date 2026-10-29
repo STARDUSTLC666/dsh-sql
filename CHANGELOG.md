@@ -2,6 +2,11 @@
 
 [返回简介](README.md) · [使用说明](docs/USAGE.md) · [验证记录](docs/VALIDATION.md)
 
+## 0.5.6 (2026-10-29)
+
+- 同步仓库与 npm 的简明介绍、中英文 README 和反馈入口；本次为文档与包元数据更新。
+- Sync npm descriptions and both README guides with the repository, including issue and pull-request links.
+
 ## 0.5.5 (2026-10-28)
 
 - 写入确认与健康检查正确读取会话审批策略。never 或未知策略明确说明操作未执行及恢复方式；保留宿主拒绝、只读限制与完整 SQL 审批摘要。
