@@ -1,9 +1,16 @@
 # 更新记录
 
-## 0.5.9 (2026-11-03)
+## 0.5.10 (2026-11-03)
 
 - 连接与模式查询失败保留原文并追加下一步；sql_list 补端口；空态给指引。
 - Connection and schema failures keep the original error and add next steps; sql_list shows ports; empty states guide the next action.
+
+## 0.5.9 (2026-10-30)
+
+- 重整中英文首页：用途、三步流程图、安装入口与操作示例；详细配置与边界集中到完整说明。
+- 保留下载统计、独立更新选择、问题反馈和贡献入口；原封面与运行功能保留。
+- Refresh bilingual landing pages, workflow artwork, quick starts and reference navigation.
+
 
 ## 0.5.8 (2026-10-30)
 
