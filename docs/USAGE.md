@@ -103,6 +103,23 @@ pnpm install
 pnpm test       # 构建 + 完整测试套件（含真实 SQLite 集成）
 ```
 
+## 故障排查
+
+先运行 `sql_health`：它逐连接探活并汇总只读模式与审批状态，失败项后面会直接给出下一步。
+
+| 现象 | 常见原因 | 处理 |
+| :-- | :-- | :-- |
+| `ECONNREFUSED` / `ETIMEDOUT` | 服务没启动、host/port 不对或被防火墙拦住 | 确认服务与端口，核对连接里的 `host`/`port` |
+| `Access denied for user` / `password authentication failed` | 账号或密码不对 | 核对 `user`/`password`；密码建议用环境变量 `DSH_SQL_PASSWORD_<连接名大写>` |
+| `Unknown database` / `database "…" does not exist` | 库名写错或尚未创建 | 核对 `database` 字段 |
+| `SQLITE_CANTOPEN` / `unable to open database file` | 路径不存在，或运行账号没有读写权限 | 检查文件路径、目录可写性与进程账号 |
+| `no such table` / `relation "…" does not exist` | 表名、大小写或 Schema 不对 | 先不带 `table` 运行 `sql_schema` 看真实表名 |
+| 写操作返回「0 行受影响」 | `WHERE` 没命中，或执行的是 DDL/多语句脚本 | 用 `sql_query` 复核条件与数据 |
+| `sql_exec` 报「需要确认但无法询问」 | 会话审批策略是 `never` | 切到可询问模式，或明确设置 `writeApproval: false` 后重启（之后不再询问） |
+| `sql_schema` 返回「没有取到列」 | 表不存在，或当前账号没有读取权限 | 先列全部表，再核对大小写与权限 |
+
+自检正常但查询仍被拒绝时，先确认是不是只读限制：写语句（INSERT/UPDATE/DDL）要走 `sql_exec`。
+
 ## License
 
 MIT

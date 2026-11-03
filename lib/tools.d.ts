@@ -26,6 +26,16 @@ export interface SqlToolDefinition {
     execute(args: unknown, exec: unknown): Promise<unknown>;
     timeoutMs?: number;
 }
+/**
+ * 把驱动/连接的原始错误映射成一行可执行的「下一步」。
+ *
+ * 之前 sql_list / sql_health / sql_query 直接把驱动原文（ECONNREFUSED、
+ * ER_ACCESS_DENIED_ERROR、SQLITE_CANTOPEN…）交给用户，知道怎么修的人能看懂，
+ * 不知道的人只能反复重试。这里只补一行提示，原始错误文本一律保留。
+ */
+export declare function connectionErrorHint(message: string): string | undefined;
+/** 给错误补一行「下一步」；无法识别时原样返回，避免把断言类错误改写成连接问题。 */
+export declare function annotateError(error: unknown): Error;
 /** 词法校验需要区分的三种引擎。 */
 type SqlEngine = 'sqlite' | 'mysql' | 'postgres';
 /**

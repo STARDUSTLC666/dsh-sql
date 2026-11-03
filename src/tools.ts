@@ -59,6 +59,34 @@ function executionSignal(exec: unknown): AbortSignal | undefined {
   return signal instanceof AbortSignal ? signal : undefined
 }
 
+/**
+ * 把驱动/连接的原始错误映射成一行可执行的「下一步」。
+ *
+ * 之前 sql_list / sql_health / sql_query 直接把驱动原文（ECONNREFUSED、
+ * ER_ACCESS_DENIED_ERROR、SQLITE_CANTOPEN…）交给用户，知道怎么修的人能看懂，
+ * 不知道的人只能反复重试。这里只补一行提示，原始错误文本一律保留。
+ */
+export function connectionErrorHint(message: string): string | undefined {
+  if (/ECONNREFUSED/i.test(message)) return '目标地址拒绝连接：请确认数据库服务已启动、host 与 port 正确，并检查防火墙是否放行。'
+  if (/ENOTFOUND|EAI_AGAIN|getaddrinfo/i.test(message)) return '主机名解析失败：请检查连接配置里的 host 拼写，以及本机 DNS/网络是否可用。'
+  if (/ETIMEDOUT|timed out|timeout exceeded|connection timeout/i.test(message)) return '连接或查询超时：请确认网络可达与服务器负载，必要时调大 queryTimeoutMs / execTimeoutMs 后重试。'
+  if (/password authentication failed|Access denied for user|authentication failed/i.test(message)) return '认证失败：请核对 user 与 password；也可改用环境变量 DSH_SQL_PASSWORD_<连接名大写> 提供密码，避免明文写进配置。'
+  if (/Unknown database|ER_BAD_DB_ERROR|database .* does not exist|\b3D000\b/i.test(message)) return '数据库不存在：请核对连接配置里的 database，或先在服务器上创建该库。'
+  if (/no such table|SQLITE_ERROR: no such table|relation .* does not exist|\b42P01\b/i.test(message)) return '表不存在：先用 sql_schema（不带 table）查看该连接的表清单，注意大小写与实际 schema。'
+  if (/SQLITE_CANTOPEN|unable to open database file|EACCES|EPERM|readonly database/i.test(message)) return 'SQLite 文件无法打开或没有权限：请检查文件路径是否存在、所在目录可写、进程账号有读写权限。'
+  if (/ECONNRESET|EPIPE|Connection terminated|server closed the connection/i.test(message)) return '连接被对端关闭：可能是服务器重启或中间代理断开，请重试一次；持续出现时检查连接池与代理设置。'
+  if (/no pg_hba\.conf entry|unsupported startup parameter|\b28000\b/i.test(message)) return '服务器拒绝本次连接：请核对 pg_hba.conf 与账号来源限制，确认该主机与该用户被允许登录。'
+  return undefined
+}
+
+/** 给错误补一行「下一步」；无法识别时原样返回，避免把断言类错误改写成连接问题。 */
+export function annotateError(error: unknown): Error {
+  const message = error instanceof Error ? error.message : String(error)
+  const hint = connectionErrorHint(message)
+  if (hint === undefined || message.includes('下一步：')) return error instanceof Error ? error : new Error(message)
+  return new Error(message + '\n下一步：' + hint)
+}
+
 /** 只读语句关键字白名单。 */
 const READ_KEYWORDS = /^(select|pragma|explain|show|describe|desc|with)\b/i
 
@@ -319,7 +347,7 @@ const listSchema = {
       type: 'array',
       items: {
         type: 'object',
-        properties: { name: { type: 'string' }, engine: { type: 'string' }, host: { type: 'string' }, database: { type: 'string' }, file: { type: 'string' }, ok: { type: 'boolean' }, error: { type: 'string' } },
+        properties: { name: { type: 'string' }, engine: { type: 'string' }, host: { type: 'string' }, port: { type: 'integer' }, database: { type: 'string' }, file: { type: 'string' }, ok: { type: 'boolean' }, error: { type: 'string' } },
         additionalProperties: true,
       },
     },
@@ -447,6 +475,16 @@ export function buildSqlTools(config: ResolvedSqlConfig, policyOf: (execution: u
     return { adapter, name: connection.name }
   }
 
+  /** 适配器调用统一兜底：被取消时原样抛出，其余错误补「下一步」。 */
+  const guard = async <T>(signal: AbortSignal | undefined, work: () => Promise<T>): Promise<T> => {
+    try {
+      return await work()
+    } catch (error) {
+      signal?.throwIfAborted()
+      throw annotateError(error)
+    }
+  }
+
   const pingAllConnections = async (signal?: AbortSignal): Promise<Array<Record<string, unknown>>> => {
     const rows: Array<Record<string, unknown>> = []
     for (const connection of cfg.connections) {
@@ -454,6 +492,8 @@ export function buildSqlTools(config: ResolvedSqlConfig, policyOf: (execution: u
       if (connection.engine === 'sqlite') entry.file = connection.file ?? ':memory:'
       else {
         entry.host = connection.host ?? ''
+        // 端口要一并返回，否则渲染只能显示 host:undefined/database。
+        entry.port = connection.port
         entry.database = connection.database ?? ''
       }
       try {
@@ -464,7 +504,7 @@ export function buildSqlTools(config: ResolvedSqlConfig, policyOf: (execution: u
       } catch (error) {
         signal?.throwIfAborted()
         entry.ok = false
-        entry.error = error instanceof Error ? error.message : String(error)
+        entry.error = annotateError(error).message
       }
       rows.push(entry)
     }
@@ -481,10 +521,15 @@ export function buildSqlTools(config: ResolvedSqlConfig, policyOf: (execution: u
         const rec = asRecord(value)
         const connections = Array.isArray(rec.connections) ? rec.connections : []
         const lines = ['共 ' + connections.length + ' 个数据库连接：']
+        const bad: string[] = []
         for (const item of connections) {
           const c = asRecord(item)
-          const target = c.file !== undefined && c.file !== '' ? c.file : c.host + '/' + c.database
+          const target = c.file !== undefined && c.file !== '' ? c.file : c.host + ':' + c.port + '/' + c.database
           lines.push('- ' + c.name + '（' + c.engine + ' @ ' + target + '）' + (c.ok === true ? ' ✅' : ' ❌ ' + String(c.error ?? '')))
+          if (c.ok !== true) bad.push(String(c.name))
+        }
+        if (bad.length > 0) {
+          lines.push('', '下一步：先修好 ' + bad.join('、') + '（核对 host/port、服务是否启动、账号密码或 SQLite 文件路径），再运行 sql_list 复查。')
         }
         return [{ type: 'text', text: lines.join('\n') }]
       },
@@ -527,7 +572,7 @@ export function buildSqlTools(config: ResolvedSqlConfig, policyOf: (execution: u
       // 先按目标连接的引擎做词法校验，再打开数据库：被拒绝的 SQL 不该去建连接或建库文件。
       const sql = assertReadQuery(rawSql, findConnection(connectionName).engine)
       const { adapter, name } = getAdapter(connectionName)
-      const result = await adapter.query(sql, cfg.maxRows + 1, executionSignal(exec))
+      const result = await guard(executionSignal(exec), () => adapter.query(sql, cfg.maxRows + 1, executionSignal(exec)))
       const total = result.rows.length
       const rows = result.rows.slice(0, cfg.maxRows)
       const format = optionalString(args, 'format')?.toLowerCase() ?? 'table'
@@ -563,7 +608,9 @@ export function buildSqlTools(config: ResolvedSqlConfig, policyOf: (execution: u
       schema: execSchema,
       render: (_args, value) => {
         const rec = asRecord(value)
-        return [{ type: 'text', text: '执行完成（' + rec.connection + '）：影响 ' + rec.changes + ' 行。' }]
+        const changes = typeof rec.changes === 'number' ? rec.changes : 0
+        const tail = changes === 0 ? '\n注意：0 行受影响，通常是 WHERE 条件没有命中数据，或用的是 DDL/多语句脚本；可用 sql_query 复核。' : ''
+        return [{ type: 'text', text: '执行完成（' + rec.connection + '）：影响 ' + changes + ' 行。' + tail }]
       },
     },
     async execute(rawArgs: unknown, exec: unknown) {
@@ -571,7 +618,7 @@ export function buildSqlTools(config: ResolvedSqlConfig, policyOf: (execution: u
       const args = asRecord(rawArgs)
       const sql = requiredString(args, 'sql', 'SQL 语句')
       const { adapter, name } = getAdapter(optionalString(args, 'connection'))
-      const changes = await adapter.exec(sql, executionSignal(exec))
+      const changes = await guard(executionSignal(exec), () => adapter.exec(sql, executionSignal(exec)))
       return { connection: name, changes, readOnly: false }
     },
     timeoutMs: cfg.execTimeoutMs,
@@ -589,7 +636,11 @@ export function buildSqlTools(config: ResolvedSqlConfig, policyOf: (execution: u
       render: (_args, value) => {
         const rec = asRecord(value)
         const columns = Array.isArray(rec.columns) ? rec.columns : []
-        if (columns.length > 0) {
+        // 指定了 table 却没有列：不能落到「共 0 张表」，那会把「表不存在」说成「库是空的」。
+        if (typeof rec.table === 'string' && rec.table !== '') {
+          if (columns.length === 0) {
+            return [{ type: 'text', text: '没有取到表 ' + rec.table + ' 的列：该表可能不存在、大小写/Schema 不匹配，或当前账号没有读取权限。\n下一步：先调用 sql_schema（不带 table）查看连接 ' + rec.connection + ' 的表清单，再用清单里的原名重试。' }]
+          }
           const lines = ['表 ' + rec.table + ' 的列：']
           for (const item of columns) {
             const c = asRecord(item)
@@ -598,6 +649,7 @@ export function buildSqlTools(config: ResolvedSqlConfig, policyOf: (execution: u
           return [{ type: 'text', text: lines.join('\n') }]
         }
         const tables = Array.isArray(rec.tables) ? rec.tables : []
+        if (tables.length === 0) return [{ type: 'text', text: '连接 ' + rec.connection + ' 里没有用户表（库可能是空的，或该账号只能看到部分 Schema）。' }]
         return [{ type: 'text', text: '共 ' + tables.length + ' 张表：' + tables.join(', ') }]
       },
     },
@@ -607,10 +659,10 @@ export function buildSqlTools(config: ResolvedSqlConfig, policyOf: (execution: u
       const table = optionalString(args, 'table')
       const signal = executionSignal(exec)
       if (table !== undefined) {
-        const columns = await adapter.describeTable(table, signal)
+        const columns = await guard(signal, () => adapter.describeTable(table, signal))
         return { connection: name, table, columns, tables: [] }
       }
-      const tables = await adapter.listTables(signal)
+      const tables = await guard(signal, () => adapter.listTables(signal))
       return { connection: name, tables, columns: [] }
     },
     timeoutMs: 30000,
@@ -630,7 +682,11 @@ export function buildSqlTools(config: ResolvedSqlConfig, policyOf: (execution: u
         const lines = ['连接 ' + rec.connection + '（' + rec.engine + '）：共 ' + tables.length + ' 张表' + (typeof rec.sizeBytes === 'number' && rec.sizeBytes >= 0 ? '，库体积 ' + formatBytes(rec.sizeBytes) : '') + '。']
         for (const item of tables.slice(0, 30)) {
           const t = asRecord(item)
-          lines.push('- ' + t.name + '：' + (typeof t.rowCount === 'number' ? t.rowCount + ' 行' : '行数未知' + (t.error ? '（' + t.error + '）' : '')))
+          const label = typeof t.name === 'string' && t.name !== '' ? t.name : '（表清单读取失败）'
+          lines.push('- ' + label + '：' + (typeof t.rowCount === 'number' ? t.rowCount + ' 行' : '行数未知' + (t.error ? '（' + t.error + '）' : '')))
+        }
+        if (tables.length > 0 && tables.every((item) => typeof asRecord(item).rowCount !== 'number') && tables.every((item) => asRecord(item).error !== undefined)) {
+          lines.push('', '下一步：统计信息读不到时，先用 sql_schema 确认表清单可用、账号有读取系统表/information_schema 的权限，再用 sql_query 手动 COUNT(*)。')
         }
         if (tables.length > 30) lines.push('…仅展示前 30 张表')
         return [{ type: 'text', text: lines.join('\n') }]
@@ -663,7 +719,7 @@ export function buildSqlTools(config: ResolvedSqlConfig, policyOf: (execution: u
           tables.push({ name: '', error: error instanceof Error ? error.message : String(error) })
         }
       } else {
-        const names = await adapter.listTables(signal)
+        const names = await guard(signal, () => adapter.listTables(signal))
         for (const table of names) {
           try {
             const result = await adapter.query('SELECT COUNT(*) FROM ' + quoteIdent(engine, table), 1, signal)
@@ -697,6 +753,14 @@ export function buildSqlTools(config: ResolvedSqlConfig, policyOf: (execution: u
         lines.push('- 只读模式：' + (rec.readOnly === true ? '开（sql_exec 已禁用）' : '关'))
         lines.push('- 写审批门：' + String(rec.writeApprovalDetail ?? (rec.writeApproval === true ? '开' : '关')))
         lines.push('- 行数上限：' + String(rec.maxRows) + '；查询超时 ' + String(rec.queryTimeoutMs) + 'ms；写超时 ' + String(rec.execTimeoutMs) + 'ms')
+        // 自检的价值在于失败时告诉用户下一步做什么，而不只是把 ❌ 摆出来。
+        if (bad.length > 0) {
+          lines.push('- 下一步：逐个修好上面的 ❌ 连接（核对 host/port、数据库服务是否启动、账号密码或 SQLite 文件路径与权限），再运行 sql_health 复查。')
+        }
+        if (rec.writeApprovalReady === false) {
+          lines.push('- 下一步：写审批门当前无法确认。把会话审批策略切到可询问（ask），或由用户明确设置 writeApproval=false 后重启（之后 sql_exec 不再询问，慎用）。')
+        }
+        if (rec.readOnly === true) lines.push('- 说明：readOnly=true 时 sql_exec 被禁用属于配置预期，不是故障。')
         return [{ type: 'text', text: lines.join('\n') }]
       },
     },

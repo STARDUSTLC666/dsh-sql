@@ -101,6 +101,23 @@ pnpm install
 pnpm test       # build + full test suite, including a real SQLite integration suite
 ```
 
+## Troubleshooting
+
+Run `sql_health` first: it pings every connection and summarizes read-only and approval settings, and each failing check carries the next step.
+
+| Symptom | Usual cause | What to do |
+| :-- | :-- | :-- |
+| `ECONNREFUSED` / `ETIMEDOUT` | Server down, wrong host/port, or firewall | Verify the server and port, then check `host`/`port` in the connection |
+| `Access denied for user` / `password authentication failed` | Wrong user or password | Check `user`/`password`; prefer the `DSH_SQL_PASSWORD_<CONNECTION>` env var |
+| `Unknown database` / `database "…" does not exist` | Typo, or the database was never created | Check the `database` field |
+| `SQLITE_CANTOPEN` / `unable to open database file` | Missing path, or no read/write permission | Check the file path, directory permissions, and the account running DSH |
+| `no such table` / `relation "…" does not exist` | Wrong table name, case, or schema | Call `sql_schema` without `table` to list the real names |
+| Write reports "0 rows affected" | `WHERE` matched nothing, or the script was DDL/multi-statement | Re-check the predicate and data with `sql_query` |
+| `sql_exec` says confirmation cannot be asked | Session approval policy is `never` | Switch to an ask-capable policy, or explicitly set `writeApproval: false` and restart (no more prompts) |
+| `sql_schema` returns no columns | Table missing, or the account cannot read it | List all tables first, then check case and permissions |
+
+If health is green but a query is still rejected, check the read-only rule: writes (INSERT/UPDATE/DDL) belong in `sql_exec`.
+
 ## License
 
 MIT
