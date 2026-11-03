@@ -1,5 +1,10 @@
 # 更新记录
 
+## 0.5.9 (2026-11-03)
+
+- 连接与模式查询失败保留原文并追加下一步；sql_list 补端口；空态给指引。
+- Connection and schema failures keep the original error and add next steps; sql_list shows ports; empty states guide the next action.
+
 ## 0.5.8 (2026-10-30)
 
 - 原生插件列表与详情新增专门生成的鲸鱼娘图标：大头像、独立功能符号、透明留白，适合 30 / 36 px 显示；原封面保留。
