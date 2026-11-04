@@ -1,5 +1,11 @@
 # 更新记录
 
+## 0.5.11 (2026-11-04)
+
+- 同步共享界面：嵌入设置时继承宿主底色，输入框跟随主题，空状态保持可读宽度；新版 DSH 可显示插件设置图标。
+- Align embedded surfaces, themed inputs, readable empty states and optional native settings icons.
+
+
 ## 0.5.10 (2026-11-03)
 
 - 连接与模式查询失败保留原文并追加下一步；sql_list 补端口；空态给指引。
