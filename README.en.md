@@ -4,6 +4,8 @@
 
 **Inspect the schema, then answer questions with data.**
 
+SQL database plugin for DeepSeek Harness (`>=0.2.2-rc.3`): supports schema inspection, bounded streaming read queries, table stats, and approval-gated writes across SQLite, MySQL, and PostgreSQL with graceful async pool shutdown.
+
 [![npm](https://img.shields.io/npm/v/dsh-sql)](https://www.npmjs.com/package/dsh-sql) [![downloads](https://raw.githubusercontent.com/STARDUSTLC666/dsh-suite/npm-downloads/assets/dsh-sql-downloads.svg)](https://www.npmjs.com/package/dsh-sql) [![total downloads](https://raw.githubusercontent.com/STARDUSTLC666/dsh-suite/npm-downloads/assets/dsh-sql-total-downloads.svg)](https://www.npmjs.com/package/dsh-sql)
 
 **[Install](#install) · [Workflow](#start-using-it) · [Full guide](https://github.com/STARDUSTLC666/dsh-sql/blob/master/docs/REFERENCE.en.md)**

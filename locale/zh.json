@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "数据库",
-    "description": "统一支持 SQLite、MySQL 与 PostgreSQL 的表结构探查、流式安全查询、库表统计与受审批写操作。"
+    "description": "统一支持 SQLite、MySQL 与 PostgreSQL 的结构探查、有界流式查询、表统计与受审批写操作。"
   }
 }

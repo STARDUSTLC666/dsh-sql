@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "SQL",
-    "description": "Inspect schemas, run bounded streaming queries, collect table statistics, and execute approval-gated writes across SQLite, MySQL, and PostgreSQL."
+    "description": "Inspect schemas, run bounded streaming queries, collect table stats, and execute approval-gated writes across SQLite, MySQL, and PostgreSQL."
   }
 }

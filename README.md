@@ -4,6 +4,8 @@
 
 **先看表结构，再用查询回答问题。**
 
+DeepSeek Harness（`>=0.2.2-rc.3`）数据库插件：统一支持 SQLite、MySQL 与 PostgreSQL 的表结构探查、有界流式只读查询、表统计分析及受宿主审批门控的写操作，支持异步安全关闭连接池。
+
 [![npm](https://img.shields.io/npm/v/dsh-sql)](https://www.npmjs.com/package/dsh-sql) [![downloads](https://raw.githubusercontent.com/STARDUSTLC666/dsh-suite/npm-downloads/assets/dsh-sql-downloads.svg)](https://www.npmjs.com/package/dsh-sql) [![total downloads](https://raw.githubusercontent.com/STARDUSTLC666/dsh-suite/npm-downloads/assets/dsh-sql-total-downloads.svg)](https://www.npmjs.com/package/dsh-sql)
 
 **[安装使用](#安装) · [使用流程](#开始使用) · [完整说明](https://github.com/STARDUSTLC666/dsh-sql/blob/master/docs/REFERENCE.zh.md)**
