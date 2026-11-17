@@ -22,4 +22,27 @@ test('名称与版本', () => {
   const pkg = require('../package.json')
   assert.equal(pkg.name, 'dsh-sql')
   assert.match(pkg.version, /^\d+\.\d+\.\d+$/)
+  assert.equal(pkg.dsh.manifestVersion, 1)
+  assert.equal(pkg.exports['./locale/*.json'], './locale/*.json')
+  assert.ok(existsSync(new URL('../locale/zh.json', import.meta.url)))
+  assert.ok(existsSync(new URL('../locale/en.json', import.meta.url)))
+})
+
+test('Cordis 4 ctx.effect 异步卸载时关闭数据库连接并注销工具', async () => {
+  const { apply } = await import('../lib/index.js')
+  const active = new Set()
+  const effects = []
+  apply({
+    tools: {
+      register(def) {
+        active.add(def.name)
+        return () => active.delete(def.name)
+      },
+    },
+    on() { return () => {} },
+    effect(fn) { effects.push(fn()) },
+  }, { connections: { mem: { engine: 'sqlite', file: ':memory:' } } })
+  assert.equal(active.size, 6)
+  for (const dispose of effects) await dispose?.()
+  assert.equal(active.size, 0)
 })

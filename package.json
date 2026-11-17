@@ -1,6 +1,6 @@
 {
   "name": "dsh-sql",
-  "version": "0.5.13",
+  "version": "0.5.14",
   "description": "DSH 数据库工具：SQLite / MySQL / PostgreSQL 查询、结构与统计、只读保护和写操作确认。欢迎提交 issues 和 PR。",
   "type": "module",
   "main": "lib/index.js",
@@ -12,7 +12,9 @@
     },
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json",
-    "./client": "./lib/update-client.js"
+    "./client": "./lib/update-client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./assets/plugin-icon.webp"
   },
   "files": [
     "lib",
@@ -21,7 +23,8 @@
     "README.en.md",
     "docs",
     "CHANGELOG.md",
-    "assets/plugin-icon.webp"
+    "assets/plugin-icon.webp",
+    "locale"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json && node scripts/build-updates.mjs",
@@ -30,6 +33,7 @@
     "prepublishOnly": "npm run build"
   },
   "dsh": {
+    "manifestVersion": 1,
     "bundle": {
       "patch": "./cordis.patch.yml"
     },

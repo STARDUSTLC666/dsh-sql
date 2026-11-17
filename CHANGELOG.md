@@ -1,5 +1,10 @@
 # 更新记录
 
+## 0.5.14 (2026-11-18)
+
+- 深度适配 DSH 0.2.2：补齐 manifestVersion 1 与双语元数据；改用异步 Cordis 4 `ctx.effect` 等待全部数据库连接池安全关闭，兼容 `effectivePolicy` 审批策略并为只读工具声明并发安全。
+- Deeply adapt to DSH 0.2.2: add manifestVersion 1 and bilingual locale metadata; await database adapter teardown via async Cordis 4 `ctx.effect`, honor `effectivePolicy` in approval checks, and mark read-only tools concurrency-safe.
+
 ## 0.5.13 (2026-11-17)
 
 - 在原生插件详情页单独检查和安装兼容版本。自动安装默认关闭，可为该插件开启空闲时的稳定补丁更新。

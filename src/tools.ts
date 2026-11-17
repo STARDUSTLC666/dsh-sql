@@ -21,6 +21,7 @@ export interface SqlToolDefinition {
     schema: Record<string, unknown>
     render(args: unknown, value: unknown): ContentBlock[]
   }
+  isConcurrencySafe?(args?: unknown): boolean
   execute(args: unknown, exec: unknown): Promise<unknown>
   timeoutMs?: number
 }
@@ -513,6 +514,7 @@ export function buildSqlTools(config: ResolvedSqlConfig, policyOf: (execution: u
 
   const sqlList: SqlToolDefinition = {
     name: 'sql_list',
+    isConcurrencySafe: () => true,
     description: '列出配置的数据库连接并逐一做连通性测试（SELECT 1）。返回连接名、引擎、目标与健康状态。',
     parameters: compileParameters({}),
     output: {
@@ -542,6 +544,7 @@ export function buildSqlTools(config: ResolvedSqlConfig, policyOf: (execution: u
 
   const sqlQuery: SqlToolDefinition = {
     name: 'sql_query',
+    isConcurrencySafe: () => true,
     description: '执行只读 SQL 查询（SELECT / PRAGMA / EXPLAIN / SHOW / DESCRIBE / WITH）。词法级校验按引擎处理反斜杠转义，拒绝 data-modifying CTE、SELECT INTO、FOR UPDATE/FOR SHARE、非白名单 PRAGMA 与多语句。MySQL / PostgreSQL 每次查询使用独立只读事务并回滚，不受 readOnly 开关影响；PostgreSQL 还以扩展协议拒绝多命令。connection 为连接名（缺省第一个连接）。返回列名与行数据，最多 maxRows 行（超出 truncated=true）。写操作请用 sql_exec。',
     parameters: compileParameters({
       sql: { type: 'string', required: true, description: '只读 SQL 语句（必填，单条）。' },
@@ -626,6 +629,7 @@ export function buildSqlTools(config: ResolvedSqlConfig, policyOf: (execution: u
 
   const sqlSchema: SqlToolDefinition = {
     name: 'sql_schema',
+    isConcurrencySafe: () => true,
     description: '查看数据库结构：不给 table 列出全部表；给 table（表名）返回该表的列信息（名称/类型/非空/主键）。',
     parameters: compileParameters({
       table: { type: 'string', description: '表名（可选；缺省列出全部表）。' },
@@ -670,6 +674,7 @@ export function buildSqlTools(config: ResolvedSqlConfig, policyOf: (execution: u
 
   const sqlStats: SqlToolDefinition = {
     name: 'sql_stats',
+    isConcurrencySafe: () => true,
     description: '数据库概览统计：表数量、每张表的行数、库体积（SQLite 按页计算，MySQL/PostgreSQL 走系统表）。connection 为连接名（缺省第一个连接）。适合在写查询前先了解数据规模。',
     parameters: compileParameters({
       connection: { type: 'string', description: '连接名（可选，缺省第一个连接）。' },
@@ -737,6 +742,7 @@ export function buildSqlTools(config: ResolvedSqlConfig, policyOf: (execution: u
 
   const sqlHealth: SqlToolDefinition = {
     name: 'sql_health',
+    isConcurrencySafe: () => true,
     description: 'dsh-sql 自检：逐个连接做连通性测试，并汇总安全配置（只读模式、写审批门、行数上限、超时）。遇到问题时先运行本工具定位。',
     parameters: compileParameters({}),
     output: {

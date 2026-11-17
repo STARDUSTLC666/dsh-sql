@@ -7,6 +7,7 @@ export interface ApprovalContext {
             policy?: unknown;
         };
         overrideOf?(session: unknown): unknown;
+        effectivePolicy?(session: unknown): unknown;
     };
 }
 export declare function approvalPolicy(ctx: ApprovalContext, execution: unknown): ApprovalPolicy;

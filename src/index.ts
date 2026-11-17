@@ -39,6 +39,7 @@ type SqlPreExecuteListener = (
 /** 插件所需的最小 ctx 面。 */
 export interface SqlPluginContext extends ApprovalContext {
   tools: { register(definition: SqlToolDefinition): () => void }
+  effect?(effect: () => () => unknown, label?: string): unknown
   on(event: 'tools/pre-execute', listener: SqlPreExecuteListener): () => void
   on(event: 'dispose', listener: () => void): () => void
 }
@@ -76,10 +77,17 @@ export function apply(ctx: SqlPluginContext, config?: SqlConfig | null): void {
   for (const definition of tools) {
     disposers.push(ctx.tools.register(definition))
   }
-  ctx.on('dispose', () => {
+  const teardown = async () => {
     for (const dispose of disposers) dispose()
-    for (const adapter of adapters.values()) void adapter.close()
-  })
+    const active = [...adapters.values()]
+    adapters.clear()
+    await Promise.allSettled(active.map(adapter => adapter.close()))
+  }
+  if (typeof ctx.effect === 'function') {
+    ctx.effect(() => teardown, 'sql.dispose()')
+  } else if (typeof ctx.on === 'function') {
+    ctx.on('dispose', () => { void teardown() })
+  }
 }
 
 export * from './adapters.js'

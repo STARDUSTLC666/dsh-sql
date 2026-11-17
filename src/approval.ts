@@ -2,13 +2,13 @@
 export type ApprovalPolicy = 'ask' | 'never' | 'unknown'
 export interface ApprovalContext {
   get?(name: string): unknown
-  approval?: { config?: { policy?: unknown }; overrideOf?(session: unknown): unknown }
+  approval?: { config?: { policy?: unknown }; overrideOf?(session: unknown): unknown; effectivePolicy?(session: unknown): unknown }
 }
 export function approvalPolicy(ctx: ApprovalContext, execution: unknown): ApprovalPolicy {
   try {
     const service = (ctx.get ? ctx.get('approval') : ctx.approval) as ApprovalContext['approval']
     const session = (execution as { agent?: { session?: unknown } } | null)?.agent?.session
-    const policy = (session === undefined ? undefined : service?.overrideOf?.(session)) ?? service?.config?.policy
+    const policy = (session === undefined ? undefined : (service?.effectivePolicy?.(session) ?? service?.overrideOf?.(session))) ?? service?.config?.policy
     return policy === 'ask' || policy === 'never' ? policy : 'unknown'
   } catch { return 'unknown' }
 }

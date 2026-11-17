@@ -36,6 +36,7 @@ export interface SqlPluginContext extends ApprovalContext {
     tools: {
         register(definition: SqlToolDefinition): () => void;
     };
+    effect?(effect: () => () => unknown, label?: string): unknown;
     on(event: 'tools/pre-execute', listener: SqlPreExecuteListener): () => void;
     on(event: 'dispose', listener: () => void): () => void;
 }

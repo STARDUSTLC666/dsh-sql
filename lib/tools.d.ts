@@ -23,6 +23,7 @@ export interface SqlToolDefinition {
         schema: Record<string, unknown>;
         render(args: unknown, value: unknown): ContentBlock[];
     };
+    isConcurrencySafe?(args?: unknown): boolean;
     execute(args: unknown, exec: unknown): Promise<unknown>;
     timeoutMs?: number;
 }
