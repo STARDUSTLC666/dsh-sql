@@ -1,6 +1,6 @@
 {
   "name": "dsh-sql",
-  "version": "0.5.12",
+  "version": "0.5.13",
   "description": "DSH 数据库工具：SQLite / MySQL / PostgreSQL 查询、结构与统计、只读保护和写操作确认。欢迎提交 issues 和 PR。",
   "type": "module",
   "main": "lib/index.js",
@@ -34,12 +34,7 @@
       "patch": "./cordis.patch.yml"
     },
     "client": {
-      "platform": "web",
-      "inject": [
-        "@deepseek-ai/dsh-client-ui-settings",
-        "@deepseek-ai/dsh-client-ui-layout",
-        "@deepseek-ai/dsh-client-ui-sidebar"
-      ]
+      "platform": "web"
     }
   },
   "keywords": [
@@ -61,7 +56,7 @@
   "dependencies": {
     "mysql2": "^3.11.0",
     "pg": "^8.23.0",
-    "@stardustlc/dsh-updates": "0.1.4"
+    "@stardustlc/dsh-updates": "0.2.0"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
