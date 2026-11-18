@@ -1,5 +1,10 @@
 # 更新记录
 
+## 0.6.1 (2026-11-18)
+
+- 同步 `@stardustlc/dsh-updates` 0.2.3：侧边栏工作台平时默认隐藏底部更新栏（零高度占用），仅在检测到兼容新版本或执行更新时浮现单行精简提示条；完整更新设置与检查入口统一保留在 DSH「插件」详情页底部。
+- Sync `@stardustlc/dsh-updates` 0.2.3: keep the sidebar workbench update footer hidden by default when up-to-date, surfacing a single-line compact strip only for actionable updates or active jobs while retaining full controls in native Plugin Details.
+
 ## 0.6.0 (2026-11-18)
 
 - 新增零外部依赖的宿主原生 `Config` 设置表单声明（数据库密码自动脱敏，连接配置、只读开关与写审批修改后自动热重连生效），优化默认内存库提示，并补充自然语言查库与对账使用流程。
