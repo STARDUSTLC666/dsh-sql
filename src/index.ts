@@ -11,10 +11,12 @@ import { registerUpdates } from '@stardustlc/dsh-updates'
  */
 
 import { resolveConfig, type SqlConfig } from './config.js'
+import { Config as SqlConfigSchema, liveConfig } from './host-config.js'
 import { buildSqlTools, summarizeWriteScript, type SqlToolDefinition } from './tools.js'
 import { approvalPolicy, approvalProblem, type ApprovalContext } from './approval.js'
 
 /** cordis 服务注入：apply 里要用 ctx.tools，必须显式声明。 */
+export const Config = SqlConfigSchema
 export const name = 'sql'
 export const inject = ['tools']
 
@@ -50,16 +52,20 @@ export interface SqlPluginContext extends ApprovalContext {
 export function apply(ctx: SqlPluginContext, config?: SqlConfig | null): void {
   registerUpdates(ctx, { name: "dsh-sql" })
 
-  const cfg = resolveConfig(config)
+  const live = liveConfig((config ?? {}) as SqlConfig)
+  const initialCfg = resolveConfig(live)
+  const getCfg = () => resolveConfig(live)
 
   const policyOf = (exec: unknown) => approvalPolicy(ctx, exec)
-  const { tools, adapters } = buildSqlTools(cfg, policyOf)
-  if (cfg.writeApproval) {
+  const { tools, adapters } = buildSqlTools(getCfg, policyOf)
+  if (initialCfg.writeApproval) {
     ctx.on('tools/pre-execute', async (exec, next) => {
       if (exec.name !== 'sql_exec') return next()
+      const currentCfg = getCfg()
+      if (!currentCfg.writeApproval) return next()
       const downstream = await next()
       if (downstream.kind === 'deny') return downstream
-      if (cfg.readOnly) return { kind: 'deny', reason: '当前连接为只读配置，sql_exec 已禁用 / Read-only configuration; sql_exec is disabled.' }
+      if (currentCfg.readOnly) return { kind: 'deny', reason: '当前连接为只读配置，sql_exec 已禁用 / Read-only configuration; sql_exec is disabled.' }
       const problem = approvalProblem(policyOf(exec), 'writeApproval')
       if (problem) return { kind: 'deny', reason: problem }
       const args = (typeof exec.arguments === 'object' && exec.arguments !== null ? exec.arguments : {}) as Record<string, unknown>
@@ -92,4 +98,5 @@ export function apply(ctx: SqlPluginContext, config?: SqlConfig | null): void {
 
 export * from './adapters.js'
 export * from './config.js'
+export { liveConfig, createVolatile, HostValidationError, type HostSchemaNode, type HostSchemaMeta, type VolatileRef } from './host-config.js'
 export * from './tools.js'

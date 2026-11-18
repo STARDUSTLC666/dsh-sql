@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { resolveConfig, assertIdentifier, passwordEnvName } from '../lib/index.js'
+import { apply, Config, liveConfig, resolveConfig, assertIdentifier, passwordEnvName } from '../lib/index.js'
 
 test('默认：内存 SQLite 兜底连接', () => {
   const cfg = resolveConfig({})
@@ -54,4 +54,39 @@ test('assertIdentifier 防注入', () => {
   assert.equal(assertIdentifier('users', '表名'), 'users')
   assert.throws(() => assertIdentifier('users; DROP TABLE x', '表名'), /非法/)
   assert.throws(() => assertIdentifier('a b', '表名'), /非法/)
+})
+
+test('Config Schema 兼容宿主设置面板：嵌套密码脱敏、volatile 热更新与首次未配置指引', async () => {
+  assert.equal(Config[Symbol.for('schemastery')], true)
+  assert.equal(Config.dict.connections.meta.volatile, true)
+  assert.equal(Config.dict.connections.inner.dict.password.meta.role, 'secret')
+  assert.equal(Config.dict.maxRows.meta.volatile, true)
+  assert.equal(Config.dict.readOnly.meta.volatile, true)
+
+  const serialized = JSON.parse(JSON.stringify(Config))
+  assert.equal(typeof serialized.uid, 'number')
+  assert.ok(serialized.refs && typeof serialized.refs === 'object')
+
+  const parsed = Config({})
+  const registered = []
+  apply({
+    get(name) { return name === 'approval' ? { config: { policy: 'ask' } } : undefined },
+    tools: { register(def) { registered.push(def); return () => {} } },
+    on() { return () => {} },
+  }, parsed)
+
+  const schemaTool = registered.find((t) => t.name === 'sql_schema')
+  const firstSchema = await schemaTool.execute({})
+  assert.equal(firstSchema.implicitMemoryDefault, true)
+  assert.match(schemaTool.output.render({}, firstSchema)[0].text, /设置 → 插件 → 数据库/)
+
+  const updated = Config({ connections: [{ name: 'local', engine: 'sqlite', file: ':memory:' }], readOnly: true })
+  const writeSym = Symbol.for('cosmokit.volatile.write')
+  parsed.connections[writeSym](updated.connections.get())
+  parsed.readOnly[writeSym](updated.readOnly.get())
+  assert.equal(liveConfig(parsed).readOnly, true)
+  const listTool = registered.find((t) => t.name === 'sql_list')
+  const listed = await listTool.execute({})
+  assert.equal(listed.connections[0].name, 'local')
+  assert.equal(listed.implicitMemoryDefault, undefined)
 })

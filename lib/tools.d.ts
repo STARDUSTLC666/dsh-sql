@@ -62,8 +62,8 @@ export interface SqlExecGateContext {
     callId?: unknown;
     signal?: unknown;
 }
-/** 构建六个工具定义；adapters 惰性创建并按连接名缓存。 */
-export declare function buildSqlTools(config: ResolvedSqlConfig, policyOf?: (execution: unknown) => 'ask' | 'never' | 'unknown'): {
+/** 构建六个工具定义；adapters 惰性创建并按连接名缓存，支持静态配置或活引用 getter。 */
+export declare function buildSqlTools(config: ResolvedSqlConfig | (() => ResolvedSqlConfig), policyOf?: (execution: unknown) => 'ask' | 'never' | 'unknown'): {
     tools: SqlToolDefinition[];
     adapters: Map<string, DatabaseAdapter>;
 };

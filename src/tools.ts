@@ -71,7 +71,7 @@ export function connectionErrorHint(message: string): string | undefined {
   if (/ECONNREFUSED/i.test(message)) return '目标地址拒绝连接：请确认数据库服务已启动、host 与 port 正确，并检查防火墙是否放行。'
   if (/ENOTFOUND|EAI_AGAIN|getaddrinfo/i.test(message)) return '主机名解析失败：请检查连接配置里的 host 拼写，以及本机 DNS/网络是否可用。'
   if (/ETIMEDOUT|timed out|timeout exceeded|connection timeout/i.test(message)) return '连接或查询超时：请确认网络可达与服务器负载，必要时调大 queryTimeoutMs / execTimeoutMs 后重试。'
-  if (/password authentication failed|Access denied for user|authentication failed/i.test(message)) return '认证失败：请核对 user 与 password；也可改用环境变量 DSH_SQL_PASSWORD_<连接名大写> 提供密码，避免明文写进配置。'
+  if (/password authentication failed|Access denied for user|authentication failed/i.test(message)) return '认证失败：请在 DSH「设置 → 插件 → 数据库（dsh-sql）」核对 user 与 password（保存即生效），或改用环境变量 DSH_SQL_PASSWORD_<连接名大写> 提供密码，避免明文写进配置。'
   if (/Unknown database|ER_BAD_DB_ERROR|database .* does not exist|\b3D000\b/i.test(message)) return '数据库不存在：请核对连接配置里的 database，或先在服务器上创建该库。'
   if (/no such table|SQLITE_ERROR: no such table|relation .* does not exist|\b42P01\b/i.test(message)) return '表不存在：先用 sql_schema（不带 table）查看该连接的表清单，注意大小写与实际 schema。'
   if (/SQLITE_CANTOPEN|unable to open database file|EACCES|EPERM|readonly database/i.test(message)) return 'SQLite 文件无法打开或没有权限：请检查文件路径是否存在、所在目录可写、进程账号有读写权限。'
@@ -451,29 +451,42 @@ export interface SqlExecGateContext {
   signal?: unknown
 }
 
-/** 构建六个工具定义；adapters 惰性创建并按连接名缓存。 */
-export function buildSqlTools(config: ResolvedSqlConfig, policyOf: (execution: unknown) => 'ask' | 'never' | 'unknown' = () => 'unknown'): { tools: SqlToolDefinition[]; adapters: Map<string, DatabaseAdapter> } {
-  const cfg = config
+/** 构建六个工具定义；adapters 惰性创建并按连接名缓存，支持静态配置或活引用 getter。 */
+export function buildSqlTools(
+  config: ResolvedSqlConfig | (() => ResolvedSqlConfig),
+  policyOf: (execution: unknown) => 'ask' | 'never' | 'unknown' = () => 'unknown',
+): { tools: SqlToolDefinition[]; adapters: Map<string, DatabaseAdapter> } {
+  const getCfg = typeof config === 'function' ? config : () => config
+  const initialCfg = getCfg()
   const adapters = new Map<string, DatabaseAdapter>()
+  const adapterFingerprints = new Map<string, string>()
 
   /** 只解析连接配置（不建连接），用于在打开数据库前挑选词法规则。 */
-  const findConnection = (name: string | undefined): ResolvedSqlConfig['connections'][number] => {
+  const findConnection = (name: string | undefined): { cfg: ResolvedSqlConfig; connection: ResolvedSqlConfig['connections'][number] } => {
+    const cfg = getCfg()
     const target = name ?? cfg.connections[0].name
     const connection = cfg.connections.find((item) => item.name.toLowerCase() === target.toLowerCase())
     if (connection === undefined) {
-      throw new Error('未找到名为 ' + target + ' 的数据库连接。可用 sql_list 查看连接清单。')
+      throw new Error('未找到名为 ' + target + ' 的数据库连接。可用 sql_list 查看现有连接清单，或在 DSH「设置 → 插件 → 数据库（dsh-sql）」/ cordis.patch.yml 中添加该连接。')
     }
-    return connection
+    return { cfg, connection }
   }
 
-  const getAdapter = (name: string | undefined): { adapter: DatabaseAdapter; name: string } => {
-    const connection = findConnection(name)
+  const getAdapter = (name: string | undefined): { adapter: DatabaseAdapter; name: string; cfg: ResolvedSqlConfig } => {
+    const { cfg, connection } = findConnection(name)
+    const fp = JSON.stringify({ connection, readOnly: cfg.readOnly })
     let adapter = adapters.get(connection.name)
+    if (adapter !== undefined && adapterFingerprints.get(connection.name) !== fp) {
+      void adapter.close().catch(() => {})
+      adapters.delete(connection.name)
+      adapter = undefined
+    }
     if (adapter === undefined) {
       adapter = createAdapter(connection, { readOnly: cfg.readOnly })
       adapters.set(connection.name, adapter)
+      adapterFingerprints.set(connection.name, fp)
     }
-    return { adapter, name: connection.name }
+    return { adapter, name: connection.name, cfg }
   }
 
   /** 适配器调用统一兜底：被取消时原样抛出，其余错误补「下一步」。 */
@@ -486,7 +499,8 @@ export function buildSqlTools(config: ResolvedSqlConfig, policyOf: (execution: u
     }
   }
 
-  const pingAllConnections = async (signal?: AbortSignal): Promise<Array<Record<string, unknown>>> => {
+  const pingAllConnections = async (signal?: AbortSignal): Promise<{ cfg: ResolvedSqlConfig; rows: Array<Record<string, unknown>> }> => {
+    const cfg = getCfg()
     const rows: Array<Record<string, unknown>> = []
     for (const connection of cfg.connections) {
       const entry: Record<string, unknown> = { name: connection.name, engine: connection.engine }
@@ -509,7 +523,7 @@ export function buildSqlTools(config: ResolvedSqlConfig, policyOf: (execution: u
       }
       rows.push(entry)
     }
-    return rows
+    return { cfg, rows }
   }
 
   const sqlList: SqlToolDefinition = {
@@ -531,13 +545,16 @@ export function buildSqlTools(config: ResolvedSqlConfig, policyOf: (execution: u
           if (c.ok !== true) bad.push(String(c.name))
         }
         if (bad.length > 0) {
-          lines.push('', '下一步：先修好 ' + bad.join('、') + '（核对 host/port、服务是否启动、账号密码或 SQLite 文件路径），再运行 sql_list 复查。')
+          lines.push('', '下一步：先在 DSH「设置 → 插件 → 数据库（dsh-sql）」或 cordis.patch.yml 修好 ' + bad.join('、') + '（核对 host/port、服务是否启动、账号密码或 SQLite 文件路径），再运行 sql_list 复查。')
+        } else if (rec.implicitMemoryDefault === true) {
+          lines.push('', '提示：当前尚未配置外部数据库，正在使用内置临时内存库（sqlite @ :memory:）。如需连接自己的 SQLite / MySQL / PostgreSQL，请在 DSH「设置 → 插件 → 数据库（dsh-sql）」添加 connections（保存即生效），或在 cordis.patch.yml 配置（密码可填配置项或用环境变量 DSH_SQL_PASSWORD_<连接名大写>）。')
         }
         return [{ type: 'text', text: lines.join('\n') }]
       },
     },
     async execute(_rawArgs: unknown, exec: unknown) {
-      return { connections: await pingAllConnections(executionSignal(exec)) }
+      const { cfg, rows } = await pingAllConnections(executionSignal(exec))
+      return { connections: rows, ...(cfg.implicitMemoryDefault ? { implicitMemoryDefault: true } : {}) }
     },
     timeoutMs: 30000,
   }
@@ -573,8 +590,8 @@ export function buildSqlTools(config: ResolvedSqlConfig, policyOf: (execution: u
       const rawSql = requiredString(args, 'sql', 'SQL 语句')
       const connectionName = optionalString(args, 'connection')
       // 先按目标连接的引擎做词法校验，再打开数据库：被拒绝的 SQL 不该去建连接或建库文件。
-      const sql = assertReadQuery(rawSql, findConnection(connectionName).engine)
-      const { adapter, name } = getAdapter(connectionName)
+      const sql = assertReadQuery(rawSql, findConnection(connectionName).connection.engine)
+      const { adapter, name, cfg } = getAdapter(connectionName)
       const result = await guard(executionSignal(exec), () => adapter.query(sql, cfg.maxRows + 1, executionSignal(exec)))
       const total = result.rows.length
       const rows = result.rows.slice(0, cfg.maxRows)
@@ -597,7 +614,7 @@ export function buildSqlTools(config: ResolvedSqlConfig, policyOf: (execution: u
       }
       return base
     },
-    timeoutMs: cfg.queryTimeoutMs,
+    timeoutMs: initialCfg.queryTimeoutMs,
   }
 
   const sqlExec: SqlToolDefinition = {
@@ -617,14 +634,15 @@ export function buildSqlTools(config: ResolvedSqlConfig, policyOf: (execution: u
       },
     },
     async execute(rawArgs: unknown, exec: unknown) {
-      if (cfg.readOnly) throw new Error('当前配置 readOnly=true，sql_exec 已被禁用。需要写操作请把插件配置里的 readOnly 改为 false 后重启。')
+      const currentCfg = getCfg()
+      if (currentCfg.readOnly) throw new Error('当前配置 readOnly=true，sql_exec 已被禁用。需要写操作请在 DSH「设置 → 插件 → 数据库（dsh-sql）」把 readOnly 改为 false（保存即生效），或修改 cordis.patch.yml。')
       const args = asRecord(rawArgs)
       const sql = requiredString(args, 'sql', 'SQL 语句')
       const { adapter, name } = getAdapter(optionalString(args, 'connection'))
       const changes = await guard(executionSignal(exec), () => adapter.exec(sql, executionSignal(exec)))
       return { connection: name, changes, readOnly: false }
     },
-    timeoutMs: cfg.execTimeoutMs,
+    timeoutMs: initialCfg.execTimeoutMs,
   }
 
   const sqlSchema: SqlToolDefinition = {
@@ -653,13 +671,18 @@ export function buildSqlTools(config: ResolvedSqlConfig, policyOf: (execution: u
           return [{ type: 'text', text: lines.join('\n') }]
         }
         const tables = Array.isArray(rec.tables) ? rec.tables : []
-        if (tables.length === 0) return [{ type: 'text', text: '连接 ' + rec.connection + ' 里没有用户表（库可能是空的，或该账号只能看到部分 Schema）。' }]
+        if (tables.length === 0) {
+          if (rec.implicitMemoryDefault === true) {
+            return [{ type: 'text', text: '连接 ' + rec.connection + ' 里没有用户表（当前尚未配置外部数据库，正在使用内置临时内存库 :memory:。请在 DSH「设置 → 插件 → 数据库（dsh-sql）」添加你的 SQLite / MySQL / PostgreSQL 连接，保存即生效；或在 cordis.patch.yml 配置）。' }]
+          }
+          return [{ type: 'text', text: '连接 ' + rec.connection + ' 里没有用户表（库可能是空的，或该账号只能看到部分 Schema）。' }]
+        }
         return [{ type: 'text', text: '共 ' + tables.length + ' 张表：' + tables.join(', ') }]
       },
     },
     async execute(rawArgs: unknown, exec: unknown) {
       const args = asRecord(rawArgs)
-      const { adapter, name } = getAdapter(optionalString(args, 'connection'))
+      const { adapter, name, cfg } = getAdapter(optionalString(args, 'connection'))
       const table = optionalString(args, 'table')
       const signal = executionSignal(exec)
       if (table !== undefined) {
@@ -667,7 +690,7 @@ export function buildSqlTools(config: ResolvedSqlConfig, policyOf: (execution: u
         return { connection: name, table, columns, tables: [] }
       }
       const tables = await guard(signal, () => adapter.listTables(signal))
-      return { connection: name, tables, columns: [] }
+      return { connection: name, tables, columns: [], ...(cfg.implicitMemoryDefault ? { implicitMemoryDefault: true } : {}) }
     },
     timeoutMs: 30000,
   }
@@ -737,7 +760,7 @@ export function buildSqlTools(config: ResolvedSqlConfig, policyOf: (execution: u
       }
       return { connection: name, engine, tableCount: tables.filter((t) => t.name !== '').length, tables, sizeBytes }
     },
-    timeoutMs: cfg.queryTimeoutMs,
+    timeoutMs: initialCfg.queryTimeoutMs,
   }
 
   const sqlHealth: SqlToolDefinition = {
@@ -759,19 +782,22 @@ export function buildSqlTools(config: ResolvedSqlConfig, policyOf: (execution: u
         lines.push('- 只读模式：' + (rec.readOnly === true ? '开（sql_exec 已禁用）' : '关'))
         lines.push('- 写审批门：' + String(rec.writeApprovalDetail ?? (rec.writeApproval === true ? '开' : '关')))
         lines.push('- 行数上限：' + String(rec.maxRows) + '；查询超时 ' + String(rec.queryTimeoutMs) + 'ms；写超时 ' + String(rec.execTimeoutMs) + 'ms')
+        if (rec.implicitMemoryDefault === true) {
+          lines.push('- 配置提示：当前尚未添加外部数据库，正在使用内置临时内存库（:memory:）；可在 DSH「设置 → 插件 → 数据库（dsh-sql）」添加连接（保存即生效），或在 cordis.patch.yml 配置。')
+        }
         // 自检的价值在于失败时告诉用户下一步做什么，而不只是把 ❌ 摆出来。
         if (bad.length > 0) {
-          lines.push('- 下一步：逐个修好上面的 ❌ 连接（核对 host/port、数据库服务是否启动、账号密码或 SQLite 文件路径与权限），再运行 sql_health 复查。')
+          lines.push('- 下一步：在 DSH「设置 → 插件 → 数据库（dsh-sql）」或 cordis.patch.yml 逐个修好上面的 ❌ 连接（核对 host/port、数据库服务是否启动、账号密码或 SQLite 文件路径与权限），再运行 sql_health 复查。')
         }
         if (rec.writeApprovalReady === false) {
-          lines.push('- 下一步：写审批门当前无法确认。把会话审批策略切到可询问（ask），或由用户明确设置 writeApproval=false 后重启（之后 sql_exec 不再询问，慎用）。')
+          lines.push('- 下一步：写审批门当前无法确认。把会话审批策略切到可询问（ask），或由用户明确在「设置 → 插件 → 数据库」将 writeApproval 设为 false（之后 sql_exec 不再询问，慎用）。')
         }
         if (rec.readOnly === true) lines.push('- 说明：readOnly=true 时 sql_exec 被禁用属于配置预期，不是故障。')
         return [{ type: 'text', text: lines.join('\n') }]
       },
     },
     async execute(_rawArgs: unknown, exec: unknown) {
-      const connections = await pingAllConnections(executionSignal(exec))
+      const { cfg, rows: connections } = await pingAllConnections(executionSignal(exec))
       const bad = connections.filter((c) => c.ok !== true)
       const policy = policyOf(exec)
       const writeApprovalReady = cfg.readOnly || !cfg.writeApproval || policy === 'ask'
@@ -788,6 +814,7 @@ export function buildSqlTools(config: ResolvedSqlConfig, policyOf: (execution: u
         maxRows: cfg.maxRows,
         queryTimeoutMs: cfg.queryTimeoutMs,
         execTimeoutMs: cfg.execTimeoutMs,
+        ...(cfg.implicitMemoryDefault ? { implicitMemoryDefault: true } : {}),
       }
     },
     timeoutMs: 30000,

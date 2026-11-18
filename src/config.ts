@@ -34,6 +34,8 @@ export interface ResolvedSqlConfig {
   writeApproval: boolean
   queryTimeoutMs: number
   execTimeoutMs: number
+  /** 未显式配置 connections 时为 true（自动回退到内置 :memory: SQLite）。 */
+  implicitMemoryDefault?: boolean
 }
 
 const ENGINES = ['sqlite', 'mysql', 'postgres'] as const
@@ -73,8 +75,10 @@ export function resolveConfig(config: SqlConfig | undefined | null, env: NodeJS.
     }
     connections.push(connection)
   }
+  let implicitMemoryDefault = false
   if (connections.length === 0) {
     connections.push({ name: 'default', engine: 'sqlite', file: ':memory:' })
+    implicitMemoryDefault = true
   }
   let maxRows = 1000
   if (cfg.maxRows !== undefined) {
@@ -93,7 +97,7 @@ export function resolveConfig(config: SqlConfig | undefined | null, env: NodeJS.
   }
   const readOnly = cfg.readOnly === true
   const writeApproval = cfg.writeApproval !== false
-  return { connections, maxRows, readOnly, writeApproval, queryTimeoutMs, execTimeoutMs }
+  return { connections, maxRows, readOnly, writeApproval, queryTimeoutMs, execTimeoutMs, implicitMemoryDefault }
 }
 
 /** 校验表名/标识符，防注入到 schema 语句。 */

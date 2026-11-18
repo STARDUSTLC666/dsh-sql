@@ -1,5 +1,10 @@
 # 更新记录
 
+## 0.6.0 (2026-11-18)
+
+- 新增零外部依赖的宿主原生 `Config` 设置表单声明（数据库密码自动脱敏，连接配置、只读开关与写审批修改后自动热重连生效），优化默认内存库提示，并补充自然语言查库与对账使用流程。
+- Export a zero-dependency native DSH `Config` schema with password masking and automatic adapter hot-reload on Settings saves, improved unconfigured `:memory:` guidance, and human-centric SQL workflow docs.
+
 ## 0.5.16 (2026-11-18)
 
 - 更新区底部新增克制、无打扰的 GitHub 点赞与问题反馈快捷链接，并完善中英文检索关键词。

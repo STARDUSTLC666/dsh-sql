@@ -12,6 +12,7 @@ import { type SqlConfig } from './config.js';
 import { type SqlToolDefinition } from './tools.js';
 import { type ApprovalContext } from './approval.js';
 /** cordis 服务注入：apply 里要用 ctx.tools，必须显式声明。 */
+export declare const Config: import("./host-config.js").HostSchemaNode<SqlConfig>;
 export declare const name = "sql";
 export declare const inject: string[];
 /** Harness `tools/pre-execute` 的决策结果。 */
@@ -46,4 +47,5 @@ export interface SqlPluginContext extends ApprovalContext {
 export declare function apply(ctx: SqlPluginContext, config?: SqlConfig | null): void;
 export * from './adapters.js';
 export * from './config.js';
+export { liveConfig, createVolatile, HostValidationError, type HostSchemaNode, type HostSchemaMeta, type VolatileRef } from './host-config.js';
 export * from './tools.js';
