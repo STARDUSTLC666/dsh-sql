@@ -1,6 +1,6 @@
 {
   "name": "dsh-sql",
-  "version": "0.6.3",
+  "version": "0.6.4",
   "description": "DeepSeek Harness 数据库插件：SQLite / MySQL / PostgreSQL 结构探查、限流查询与写操作审批。欢迎提交 issues 和 PR。",
   "type": "module",
   "main": "lib/index.js",
@@ -63,7 +63,7 @@
   "dependencies": {
     "mysql2": "^3.11.0",
     "pg": "^8.23.0",
-    "@stardustlc/dsh-updates": "0.2.5"
+    "@stardustlc/dsh-updates": "0.2.6"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
