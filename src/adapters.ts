@@ -230,7 +230,7 @@ class SqliteAdapter implements DatabaseAdapter {
       name: String(row.name),
       type: String(row.type ?? ''),
       notNull: Number(row.notnull) === 1,
-      primaryKey: Number(row.pk) === 1,
+      primaryKey: Number(row.pk) > 0,
     }))
   }
   async query(sql: string, limit?: number, signal?: AbortSignal) {
