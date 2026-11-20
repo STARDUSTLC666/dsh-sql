@@ -41,6 +41,28 @@ function abortReason(signal: AbortSignal): unknown {
   return error
 }
 
+/** Pool acquisition can wait indefinitely; return late unused clients. */
+function acquireWithSignal<T>(acquire: () => Promise<T>, release: (resource: T) => void, signal?: AbortSignal): Promise<T> {
+  signal?.throwIfAborted()
+  if (signal === undefined) return acquire()
+  return new Promise<T>((resolve, reject) => {
+    const cleanup = (): void => signal.removeEventListener('abort', onAbort)
+    const onAbort = (): void => { cleanup(); reject(abortReason(signal)) }
+    signal.addEventListener('abort', onAbort, { once: true })
+    let pending: Promise<T>
+    try { pending = acquire() } catch (error) { cleanup(); reject(error); return }
+    pending.then(resource => {
+      cleanup()
+      if (signal.aborted) {
+        // No SQL ran on this client, so it is safe to return to the pool.
+        try { release(resource) } catch (error) { reject(error) }
+        return
+      }
+      resolve(resource)
+    }, error => { cleanup(); reject(error) })
+  })
+}
+
 function toValue(value: unknown): unknown {
   if (typeof value === 'bigint') {
     if (value >= BigInt(Number.MIN_SAFE_INTEGER) && value <= BigInt(Number.MAX_SAFE_INTEGER)) {
@@ -261,7 +283,7 @@ class MysqlAdapter implements DatabaseAdapter {
   }
   private async withSignalConnection<T>(signal: AbortSignal | undefined, work: (connection: mysql.PoolConnection, discard: () => void, isDiscarded: () => boolean) => Promise<T>): Promise<T> {
     signal?.throwIfAborted()
-    const connection = await this.pool.getConnection()
+    const connection = await acquireWithSignal(() => this.pool.getConnection(), connection => connection.release(), signal)
     let destroyed = false
     let rejectAbort: (reason: unknown) => void = () => {}
     const aborted = new Promise<never>((_resolve, reject) => { rejectAbort = reject })
@@ -347,7 +369,7 @@ class PostgresAdapter implements DatabaseAdapter {
   }
   private async withSignalClient<T>(signal: AbortSignal | undefined, work: (client: pg.PoolClient, discard: () => void, isDiscarded: () => boolean) => Promise<T>): Promise<T> {
     signal?.throwIfAborted()
-    const client = await this.pool.connect()
+    const client = await acquireWithSignal(() => this.pool.connect(), client => client.release(), signal)
     let destroyed = false
     let rejectAbort: (reason: unknown) => void = () => {}
     const aborted = new Promise<never>((_resolve, reject) => { rejectAbort = reject })
