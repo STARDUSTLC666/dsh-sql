@@ -150,6 +150,61 @@ test('#3 审批摘要逐条列出语句，200 字符后的 DROP 不会被藏起�
   assert.ok(reason.reason.includes('DROP TABLE t'), reason.reason)
 })
 
+test('词法回归：注释不能把相邻关键字粘在一起绕过只读检查', () => {
+  assert.throws(() => assertReadQuery('WITH a AS (SELECT 1) DELETE/*x*/FROM items'), /DELETE/)
+  assert.throws(() => assertReadQuery("SELECT * FROM t INTO/*x*/OUTFILE '/tmp/x'"), /INTO/)
+  assert.throws(() => assertReadQuery('SELECT * FROM t FOR/*x*/UPDATE'), /FOR UPDATE/)
+})
+
+test('词法回归：MySQL 条件注释与双引号反斜杠逃逸载荷均被拒绝', () => {
+  assert.throws(() => assertReadQuery("SELECT 1 /*!50000 INTO OUTFILE '/tmp/x' */", 'mysql'), /INTO/)
+  assert.throws(() => assertReadQuery("SELECT 1 /*!50000 INTO OUTFILE '/tmp/x' */"), /INTO/)
+  assert.throws(() => assertReadQuery('SELECT 1 /*! FOR UPDATE */', 'mysql'), /FOR UPDATE/)
+  assert.throws(() => assertReadQuery(`SELECT "a\\" , " INTO OUTFILE '/tmp/x' -- "`, 'mysql'), /INTO/)
+})
+
+test('词法回归：PostgreSQL # 运算符不再误当行注释吞掉后续语句', () => {
+  assert.throws(() => assertReadQuery('SELECT 5 # 3; DELETE FROM users', 'postgres'), /一次只允许一条语句/)
+  const pgXor = summarizeWriteScript('UPDATE t SET m = m # 1; DROP TABLE users', 'postgres')
+  assert.match(pgXor, /DROP TABLE users/)
+  assert.match(pgXor, /DROP×1/)
+})
+
+test('词法回归：按引擎解析转义引号，审批摘要不会遗漏后续 DROP', () => {
+  const pgSummary = summarizeWriteScript("E'a\\'b'; DROP TABLE users; SELECT E'c'", 'postgres')
+  assert.match(pgSummary, /DROP TABLE users/)
+  assert.match(pgSummary, /DROP×1/)
+
+  const mysqlSummary = summarizeWriteScript("'a\\'b'; DROP TABLE users; SELECT 'c'", 'mysql')
+  assert.match(mysqlSummary, /DROP TABLE users/)
+  assert.match(mysqlSummary, /DROP×1/)
+})
+
+test('词法回归：PostgreSQL 嵌套块注释、数组方括号与合法只读语法', () => {
+  assert.doesNotThrow(() => assertReadQuery('SELECT /* outer /* inner ; DELETE FROM t */ still */ 1', 'postgres'))
+  assert.throws(() => assertReadQuery('SELECT ARRAY[(DELETE FROM users)]', 'postgres'), /DELETE/)
+  assert.doesNotThrow(() => assertReadQuery('(SELECT 1) UNION (SELECT 2)'))
+  assert.doesNotThrow(() => assertReadQuery("SELECT REPLACE(name, 'a', 'b') FROM users"))
+  assert.throws(() => assertReadQuery('EXPLAIN REPLACE users SET id = 1'), /REPLACE/)
+  assert.doesNotThrow(() => assertReadQuery('EXPLAIN ANALYZE SELECT 1', 'postgres'))
+  assert.doesNotThrow(() => assertReadQuery('EXPLAIN (ANALYZE, BUFFERS) SELECT 1', 'postgres'))
+  assert.throws(() => assertReadQuery('EXPLAIN ANALYZE DELETE FROM users', 'postgres'), /DELETE/)
+  assert.throws(() => assertReadQuery('ANALYZE users', 'postgres'), /只接受只读语句/)
+  assert.throws(
+    () => assertReadQuery("WITH x AS (SELECT U&'a\\' UESCAPE '!') DELETE FROM users WHERE a = 'x'", 'postgres'),
+    /DELETE/,
+  )
+  const pgUnicode = summarizeWriteScript("SELECT U&'a\\' UESCAPE '!'; DROP TABLE users; SELECT 'ok'", 'postgres')
+  assert.match(pgUnicode, /共 3 条语句：/)
+  assert.match(pgUnicode, /DROP TABLE users/)
+  assert.match(pgUnicode, /DROP×1/)
+  assert.doesNotThrow(() => assertReadQuery('DESCRIBE users', 'mysql'))
+  assert.doesNotThrow(() => assertReadQuery('DESCRIBE `create`', 'mysql'))
+  assert.doesNotThrow(() => assertReadQuery('DESC ANALYZE SELECT 1', 'mysql'))
+  assert.throws(() => assertReadQuery('DESCRIBE DELETE FROM users', 'mysql'), /DELETE/)
+  assert.throws(() => assertReadQuery('DESC ANALYZE DELETE FROM users', 'mysql'), /DELETE/)
+})
+
 function makeFakeCtx() {
   const listeners = {}
   const ctx = {

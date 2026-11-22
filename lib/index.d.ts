@@ -4,7 +4,7 @@
  * 插件导出 apply(ctx, config)：注册六个面向模型的工具（sql_list / sql_query /
  * sql_exec / sql_schema / sql_stats / sql_health），支持 SQLite / MySQL / PostgreSQL
  * 三引擎与多连接。
- * sql_exec 默认走宿主审批门（对齐 dsh-email 的发信审批），readOnly 模式可整体禁用写。
+ * sql_exec 默认走宿主审批门（对齐 dsh-email 的发信审批），全局或单连接 readOnly 模式可禁用写。
  *
  * @module dsh-sql
  */

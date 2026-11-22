@@ -3,8 +3,11 @@
  *
  * @module dsh-sql/tools
  */
-import { createAdapter, type DatabaseAdapter } from './adapters.js'
-import { type ResolvedSqlConfig } from './config.js'
+import { createAdapter, type DatabaseAdapter, type ExecOptions, type QueryOptions } from './adapters.js'
+import { parseTableRef, type ResolvedSqlConfig, type SqlConnectionConfig } from './config.js'
+import { assertReadQuery, summarizeWriteScript, splitSqlStatements, stripSqlNoise, type SqlEngine } from './sql-lexer.js'
+
+export { assertReadQuery, summarizeWriteScript, splitSqlStatements, stripSqlNoise, type SqlEngine } from './sql-lexer.js'
 
 /** 模型可见的内容块。 */
 export interface ContentBlock {
@@ -34,6 +37,10 @@ function compileParameters(spec: Record<string, any>): { type: 'object'; propert
     const node: Record<string, unknown> = {}
     if (typeof prop?.type === 'string') node.type = prop.type
     if (typeof prop?.description === 'string') node.description = prop.description
+    if (Array.isArray(prop?.enum)) node.enum = prop.enum
+    if (prop?.items !== undefined && typeof prop.items === 'object' && prop.items !== null) node.items = prop.items
+    if (typeof prop?.minimum === 'number') node.minimum = prop.minimum
+    if (typeof prop?.maximum === 'number') node.maximum = prop.maximum
     properties[key] = node
   }
   return { type: 'object', properties, ...(required.length > 0 ? { required } : {}) }
@@ -54,10 +61,48 @@ function requiredString(args: Record<string, unknown>, key: string, label: strin
   return value
 }
 
+function optionalPositiveInteger(args: Record<string, unknown>, key: string): number | undefined {
+  const value = args[key]
+  if (value === undefined || value === null) return undefined
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 1) {
+    throw new Error('参数 ' + key + ' 必须是大于等于 1 的整数。')
+  }
+  return value
+}
+
+function optionalParams(args: Record<string, unknown>): unknown[] | undefined {
+  const value = args.params
+  if (value === undefined || value === null) return undefined
+  if (!Array.isArray(value)) {
+    throw new Error('参数 params 必须是数组（SQLite/MySQL 按 ? 顺序绑定，PostgreSQL 按 $1/$2 顺序绑定）。')
+  }
+  return value
+}
+
+function parseQueryFormat(args: Record<string, unknown>): 'table' | 'csv' | 'json' {
+  const raw = args.format
+  if (raw === undefined || raw === null) return 'table'
+  if (typeof raw !== 'string') {
+    throw new Error('不支持的 format：' + String(raw) + '，可选 table / csv / json。')
+  }
+  const trimmed = raw.trim()
+  if (trimmed === '') return 'table'
+  const lower = trimmed.toLowerCase()
+  if (lower === 'table' || lower === 'csv' || lower === 'json') return lower
+  throw new Error('不支持的 format：' + trimmed + '，可选 table / csv / json。')
+}
+
 function executionSignal(exec: unknown): AbortSignal | undefined {
   if (typeof exec !== 'object' || exec === null) return undefined
   const signal = (exec as { signal?: unknown }).signal
   return signal instanceof AbortSignal ? signal : undefined
+}
+
+/** 将外部取消信号与超时信号合并，先检查外部信号是否已中止。 */
+function withTimeoutSignal(signal: AbortSignal | undefined, timeoutMs: number): AbortSignal {
+  signal?.throwIfAborted()
+  const timeoutSignal = AbortSignal.timeout(Math.max(1, timeoutMs))
+  return signal !== undefined ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal
 }
 
 /**
@@ -70,7 +115,8 @@ function executionSignal(exec: unknown): AbortSignal | undefined {
 export function connectionErrorHint(message: string): string | undefined {
   if (/ECONNREFUSED/i.test(message)) return '目标地址拒绝连接：请确认数据库服务已启动、host 与 port 正确，并检查防火墙是否放行。'
   if (/ENOTFOUND|EAI_AGAIN|getaddrinfo/i.test(message)) return '主机名解析失败：请检查连接配置里的 host 拼写，以及本机 DNS/网络是否可用。'
-  if (/ETIMEDOUT|timed out|timeout exceeded|connection timeout/i.test(message)) return '连接或查询超时：请确认网络可达与服务器负载，必要时调大 queryTimeoutMs / execTimeoutMs 后重试。'
+  if (/ETIMEDOUT|timed out|timeout exceeded|connection timeout|due to timeout|statement timeout|TimeoutError/i.test(message)) return '连接或查询超时：请确认网络可达与服务器负载，必要时调大 queryTimeoutMs / execTimeoutMs 后重试。'
+  if (/(?:^|[^a-z])(?:ssl|tls)|self-signed|certificate|no encryption|insecure transport/i.test(message)) return 'TLS/SSL 握手或加密校验失败：请在连接配置中检查 ssl 选项（云数据库通常用 ssl: "require" 或 "verify-full"，自签名证书可配置 { rejectUnauthorized: false } 或提供 ca 证书；仅本地可信网络可设为 "disable"）。'
   if (/password authentication failed|Access denied for user|authentication failed/i.test(message)) return '认证失败：请在 DSH「设置 → 插件 → 数据库（dsh-sql）」核对 user 与 password（保存即生效），或改用环境变量 DSH_SQL_PASSWORD_<连接名大写> 提供密码，避免明文写进配置。'
   if (/Unknown database|ER_BAD_DB_ERROR|database .* does not exist|\b3D000\b/i.test(message)) return '数据库不存在：请核对连接配置里的 database，或先在服务器上创建该库。'
   if (/no such table|SQLITE_ERROR: no such table|relation .* does not exist|\b42P01\b/i.test(message)) return '表不存在：先用 sql_schema（不带 table）查看该连接的表清单，注意大小写与实际 schema。'
@@ -86,234 +132,6 @@ export function annotateError(error: unknown): Error {
   const hint = connectionErrorHint(message)
   if (hint === undefined || message.includes('下一步：')) return error instanceof Error ? error : new Error(message)
   return new Error(message + '\n下一步：' + hint)
-}
-
-/** 只读语句关键字白名单。 */
-const READ_KEYWORDS = /^(select|pragma|explain|show|describe|desc|with)\b/i
-
-/** 词法校验需要区分的三种引擎。 */
-type SqlEngine = 'sqlite' | 'mysql' | 'postgres'
-
-/**
- * PostgreSQL 的 E'…' / U&'…' 会把反斜杠当转义；普通 '…' 在
- * standard_conforming_strings=on（9.1 起的默认值）下反斜杠是普通字符。
- */
-function isPostgresEscapeString(sql: string, quoteIndex: number): boolean {
-  const prev = sql[quoteIndex - 1]
-  const isWordChar = (ch: string | undefined): boolean => ch !== undefined && /[A-Za-z0-9_$]/.test(ch)
-  if (prev === 'E' || prev === 'e') return !isWordChar(sql[quoteIndex - 2])
-  if (prev === '&') {
-    const u = sql[quoteIndex - 2]
-    return (u === 'U' || u === 'u') && !isWordChar(sql[quoteIndex - 3])
-  }
-  return false
-}
-
-/**
- * 去掉字符串、引号标识符与注释，保留真实 SQL 关键字与分号。
- *
- * 反斜杠规则按引擎对齐，否则去噪结果会和服务器看到的分割方式不一致：
- * MySQL 默认把 \ 当转义；PostgreSQL 只有 E'…' / U&'…' 才转义；
- * SQLite 字符串里根本没有反斜杠转义。引号标识符（"…" 与 `…`）在三种
- * 引擎里都不把反斜杠当转义，永远按字面量处理。
- */
-function stripSqlNoise(sql: string, engine?: SqlEngine): string {
-  let out = ''
-  let i = 0
-  while (i < sql.length) {
-    const ch = sql[i]
-    const next = sql[i + 1]
-    if (ch === '-' && next === '-') {
-      i += 2
-      while (i < sql.length && sql[i] !== '\n') i += 1
-      continue
-    }
-    if (ch === '/' && next === '*') {
-      i += 2
-      while (i + 1 < sql.length && !(sql[i] === '*' && sql[i + 1] === '/')) i += 1
-      i += 2
-      continue
-    }
-    if (ch === '#' && (i === 0 || /\s/.test(sql[i - 1]))) {
-      if (/^#(?:>>?|-)/.test(sql.slice(i))) {
-        out += ch
-        i += 1
-        continue
-      }
-      i += 1
-      while (i < sql.length && sql[i] !== '\n') i += 1
-      continue
-    }
-    if (ch === "'") {
-      out += ' '
-      i += 1
-      const backslashEscapes = engine === 'mysql' || (engine === 'postgres' && isPostgresEscapeString(sql, i - 1))
-      while (i < sql.length) {
-        if (sql[i] === "'" && sql[i + 1] === "'") { i += 2; continue }
-        if (sql[i] === "'") { i += 1; break }
-        if (backslashEscapes && sql[i] === '\\') { i += 2; continue }
-        i += 1
-      }
-      continue
-    }
-    if (ch === '"' || ch === '`') {
-      out += ' '
-      i += 1
-      while (i < sql.length) {
-        if (sql[i] === ch) { i += 1; break }
-        i += 1
-      }
-      continue
-    }
-    if (ch === '[') {
-      out += ' '
-      i += 1
-      while (i < sql.length && sql[i] !== ']') i += 1
-      i += 1
-      continue
-    }
-    if (ch === '$') {
-      const dollar = /^\$[A-Za-z_][A-Za-z0-9_]*\$|^\$\$/.exec(sql.slice(i))
-      if (dollar !== null) {
-        out += ' '
-        i += dollar[0].length
-        const end = sql.indexOf(dollar[0], i)
-        i = end === -1 ? sql.length : end + dollar[0].length
-        continue
-      }
-    }
-    out += ch
-    i += 1
-  }
-  return out
-}
-
-/** 写操作关键字：出在 SELECT/EXPLAIN/WITH 语句里即拒绝。 */
-const WRITE_KEYWORDS = /\b(insert|update|delete|replace|merge|drop|alter|create|truncate|call|execute|copy|grant|revoke|attach|detach|vacuum|reindex|refresh|set|reset|begin|commit|rollback|savepoint|release|analyze|load_extension)\b/i
-
-/** 允许不带参数的只读 PRAGMA（含查询型与会话状态查询）。 */
-const READONLY_PRAGMAS = new Set([
-  'application_id',
-  'auto_vacuum',
-  'cell_size_check',
-  'collation_list',
-  'compile_options',
-  'data_version',
-  'database_list',
-  'encoding',
-  'freelist_count',
-  'function_list',
-  'journal_mode',
-  'legacy_file_format',
-  'mmap_size',
-  'module_list',
-  'page_count',
-  'page_size',
-  'pragma_list',
-  'schema_version',
-  'sqlite_version',
-  'user_version',
-])
-
-/** 允许带一个标识符参数的只读内省 PRAGMA。 */
-const READONLY_PRAGMAS_WITH_ARG = new Set([
-  'foreign_key_check',
-  'foreign_key_list',
-  'index_info',
-  'index_list',
-  'index_xinfo',
-  'integrity_check',
-  'quick_check',
-  'table_info',
-  'table_list',
-  'table_xinfo',
-])
-
-/**
- * PRAGMA 白名单：只放行只读内省。
- *
- * SQLite 里 `PRAGMA name(value)` 与 `PRAGMA name = value` 完全等价，
- * 只拦改号会让 `PRAGMA foreign_keys(0)` / `PRAGMA writable_schema(1)`
- * 这类会改连接或库文件状态的调用漏过去，所以按名字白名单放行。
- */
-function assertReadOnlyPragma(statement: string): void {
-  const match = /^pragma\s+(?:[a-z_][a-z0-9_]*\.)?([a-z_][a-z0-9_]*)\s*(.*)$/i.exec(statement)
-  if (match === null) throw new Error('无法解析这条 PRAGMA，sql_query 只接受只读的 PRAGMA 内省语句。')
-  const pragmaName = match[1].toLowerCase()
-  const rest = match[2].trim()
-  if (rest !== '' && /^[=(]/.test(rest)) {
-    if (!READONLY_PRAGMAS_WITH_ARG.has(pragmaName)) {
-      throw new Error('sql_query 不接受带参数的 PRAGMA ' + pragmaName.toUpperCase() + '（PRAGMA name(value) 与 name=value 等价，会改连接或数据库状态）。请用 sql_exec。')
-    }
-    return
-  }
-  if (!READONLY_PRAGMAS.has(pragmaName) && !READONLY_PRAGMAS_WITH_ARG.has(pragmaName)) {
-    throw new Error('sql_query 只放行只读 PRAGMA 白名单（table_info / index_list / page_count / user_version 等），' + pragmaName.toUpperCase() + ' 不在白名单内。需要修改请用 sql_exec。')
-  }
-}
-
-/**
- * 校验只读查询：词法去噪后白名单开头 + 写关键字扫描 + 单语句 + PRAGMA 白名单。
- *
- * `engine` 决定反斜杠转义规则（见 stripSqlNoise）；不传时按最保守的方式把
- * 反斜杠当字面量，宁可误拒也不放过第二条语句。
- */
-export function assertReadQuery(sql: string, engine?: SqlEngine): string {
-  const trimmed = sql.trim()
-  const clean = stripSqlNoise(trimmed, engine)
-  const first = /^[a-z]+/i.exec(clean.trim())?.[0]?.toLowerCase() ?? ''
-  if (!READ_KEYWORDS.test(clean.trim())) {
-    throw new Error('sql_query 只接受只读语句（SELECT / PRAGMA / EXPLAIN / SHOW / DESCRIBE / WITH）。写操作请用 sql_exec。')
-  }
-  const statements = clean.split(';').filter((part) => part.trim() !== '')
-  if (statements.length > 1) throw new Error('sql_query 一次只允许一条语句。')
-  const single = statements[0]?.trim() ?? ''
-  if (first === 'pragma') {
-    assertReadOnlyPragma(single)
-  } else if (first === 'show' || first === 'describe' || first === 'desc') {
-    // SHOW / DESCRIBE 本身只读，不再扫写关键字（避免误伤 SHOW CREATE TABLE）。
-  } else {
-    if (/\binto\b/i.test(single)) throw new Error('sql_query 不接受 SELECT INTO（写表或 OUTFILE），请用 sql_exec。')
-    if (/\bfor\s+(update|no\s+key\s+update|share|key\s+share)\b/i.test(single)) throw new Error('sql_query 不接受 FOR UPDATE/FOR SHARE 行锁查询，请用 sql_exec。')
-    const hit = WRITE_KEYWORDS.exec(single)
-    if (hit !== null) {
-      throw new Error('检测到写操作关键字 ' + hit[0].toUpperCase() + '，sql_query 只接受只读查询。写操作请用 sql_exec。')
-    }
-  }
-  return trimmed.replace(/;+\s*$/, '').trim()
-}
-
-/**
- * 把一段写操作脚本压成审批卡可读的摘要。
- *
- * 关键点：逐条列出每条语句，并额外给一行语句类型统计。即使脚本体被省略，
- * 第二条、第 N 条语句的 DROP / DELETE 也不会从审批文本里消失。
- */
-export function summarizeWriteScript(sql: string): string {
-  const trimmed = sql.trim()
-  const clean = stripSqlNoise(trimmed)
-  const statements = clean
-    .split(';')
-    .map((part) => part.replace(/\s+/g, ' ').trim())
-    .filter((part) => part !== '')
-  const effective = statements.length === 0 ? ['(空语句)'] : statements
-  const tally = new Map<string, number>()
-  for (const statement of effective) {
-    const keyword = /^[a-z]+/i.exec(statement)?.[0]?.toUpperCase() ?? '?'
-    tally.set(keyword, (tally.get(keyword) ?? 0) + 1)
-  }
-  const lines = ['共 ' + effective.length + ' 条语句：']
-  effective.slice(0, 100).forEach((statement, index) => {
-    lines.push('  ' + (index + 1) + '. ' + (statement.length > 120 ? statement.slice(0, 120) + '…' : statement))
-  })
-  if (effective.length > 100) lines.push('  …另有 ' + (effective.length - 100) + ' 条语句')
-  lines.push('语句类型：' + [...tally.entries()].map(([keyword, count]) => keyword + '×' + count).join('，'))
-  if (trimmed.length <= 800) {
-    lines.push('', '完整 SQL：' + trimmed)
-  } else {
-    lines.push('', '完整 SQL 共 ' + trimmed.length + ' 个字符，见本次工具调用参数。')
-  }
-  return lines.join('\n')
 }
 
 const querySchema = {
@@ -348,7 +166,18 @@ const listSchema = {
       type: 'array',
       items: {
         type: 'object',
-        properties: { name: { type: 'string' }, engine: { type: 'string' }, host: { type: 'string' }, port: { type: 'integer' }, database: { type: 'string' }, file: { type: 'string' }, ok: { type: 'boolean' }, error: { type: 'string' } },
+        properties: {
+          name: { type: 'string' },
+          engine: { type: 'string' },
+          host: { type: 'string' },
+          port: { type: 'integer' },
+          database: { type: 'string' },
+          file: { type: 'string' },
+          readOnly: { type: 'boolean' },
+          ssl: { type: 'boolean' },
+          ok: { type: 'boolean' },
+          error: { type: 'string' },
+        },
         additionalProperties: true,
       },
     },
@@ -360,12 +189,46 @@ const schemaToolSchema = {
   type: 'object',
   properties: {
     connection: { type: 'string' },
+    table: { type: 'string' },
+    schema: { type: 'string' },
+    comment: { type: 'string' },
     tables: { type: 'array', items: { type: 'string' } },
     columns: {
       type: 'array',
       items: {
         type: 'object',
-        properties: { name: { type: 'string' }, type: { type: 'string' }, notNull: { type: 'boolean' }, primaryKey: { type: 'boolean' } },
+        properties: {
+          name: { type: 'string' },
+          type: { type: 'string' },
+          notNull: { type: 'boolean' },
+          primaryKey: { type: 'boolean' },
+          defaultValue: { type: ['string', 'null'] },
+          comment: { type: ['string', 'null'] },
+        },
+        additionalProperties: true,
+      },
+    },
+    indexes: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          name: { type: 'string' },
+          unique: { type: 'boolean' },
+          columns: { type: 'array', items: { type: 'string' } },
+        },
+        additionalProperties: true,
+      },
+    },
+    foreignKeys: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          column: { type: 'string' },
+          refTable: { type: 'string' },
+          refColumn: { type: 'string' },
+        },
         additionalProperties: true,
       },
     },
@@ -379,6 +242,73 @@ const schemaToolSchema = {
 function quoteIdent(engine: string, name: string): string {
   if (engine === 'mysql') return '`' + name.replace(/`/g, '``') + '`'
   return '"' + name.replace(/"/g, '""') + '"'
+}
+
+/** 格式化单个表格单元格：处理 null、对象/数组 JSON 序列化、单行化与超长截断。 */
+function formatCell(cell: unknown, maxCellLen = 300): string {
+  if (cell === null || cell === undefined) return 'NULL'
+  let text: string
+  if (Array.isArray(cell) || typeof cell === 'object') {
+    try {
+      text = JSON.stringify(cell)
+    } catch {
+      text = String(cell)
+    }
+  } else {
+    text = String(cell)
+  }
+  text = text.replace(/\r?\n/g, '\\n')
+  if (text.length > maxCellLen) {
+    return text.slice(0, maxCellLen) + '…(已截断)'
+  }
+  return text
+}
+
+/** 表名过滤：无 `*` 时按不区分大小写子串过滤，含 `*` 时按通配符匹配。 */
+function filterTablesByPattern(tables: string[], pattern: string | undefined): string[] {
+  if (pattern === undefined) return tables
+  if (!pattern.includes('*')) {
+    const needle = pattern.toLowerCase()
+    return tables.filter((table) => table.toLowerCase().includes(needle))
+  }
+  const escaped = pattern.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*')
+  const regex = new RegExp('^' + escaped + '$', 'i')
+  const hasDot = pattern.includes('.')
+  return tables.filter((table) => {
+    if (regex.test(table)) return true
+    if (!hasDot) {
+      const dot = table.indexOf('.')
+      if (dot !== -1 && regex.test(table.slice(dot + 1))) return true
+    }
+    return false
+  })
+}
+
+function quoteDoubleIdent(name: string): string {
+  return '"' + name.replace(/"/g, '""') + '"'
+}
+
+/** 校验单段 schema 名称（拒绝多段路径与非法字符），返回去引号后的名称。 */
+function parseSingleSchema(schemaName: string): string {
+  const ref = parseTableRef(schemaName, 'schema')
+  if (ref.schema !== undefined) {
+    throw new Error('schema 非法（不能包含多段路径）：' + schemaName)
+  }
+  return ref.table
+}
+
+/**
+ * 校验并拼接 table 与可选 schema：
+ * - 先用 parseTableRef 校验 table 与 schema（拒绝多段 schema 或非法字符）；
+ * - 仅当 table 自身不含 schema 段时，安全加引号拼接为 `"schema"."table"`，
+ *   支持含点号的引号表名（如 `"my.table"`）与已加引号的 schema（如 `"analytics"`）。
+ */
+function qualifyTableRef(table: string, schemaName: string | undefined): string {
+  const tableRef = parseTableRef(table, '表名')
+  if (schemaName === undefined) return table
+  const parsedSchema = parseSingleSchema(schemaName)
+  if (tableRef.schema !== undefined) return table
+  return quoteDoubleIdent(parsedSchema) + '.' + quoteDoubleIdent(tableRef.table)
 }
 
 /** 查询结果转 CSV 文本（RFC 4180 风格转义）。 */
@@ -402,17 +332,18 @@ function formatBytes(bytes: number): string {
 }
 
 /** 库体积：SQLite 用页数×页大小；MySQL/PostgreSQL 走系统函数；失败抛错由调用方兜底。 */
-async function databaseSize(adapter: DatabaseAdapter, engine: string, signal?: AbortSignal): Promise<number> {
+async function databaseSize(adapter: DatabaseAdapter, engine: string, signal?: AbortSignal, timeoutMs?: number): Promise<number> {
+  const options: QueryOptions | undefined = timeoutMs !== undefined ? { timeoutMs } : undefined
   if (engine === 'sqlite') {
-    const pageCount = await adapter.query('PRAGMA page_count', 1, signal)
-    const pageSize = await adapter.query('PRAGMA page_size', 1, signal)
+    const pageCount = await adapter.query('PRAGMA page_count', 1, signal, options)
+    const pageSize = await adapter.query('PRAGMA page_size', 1, signal, options)
     return Number(pageCount.rows[0]?.[0] ?? 0) * Number(pageSize.rows[0]?.[0] ?? 0)
   }
   if (engine === 'mysql') {
-    const result = await adapter.query('SELECT SUM(DATA_LENGTH + INDEX_LENGTH) FROM information_schema.tables WHERE TABLE_SCHEMA = DATABASE()', 1, signal)
+    const result = await adapter.query('SELECT SUM(DATA_LENGTH + INDEX_LENGTH) FROM information_schema.tables WHERE TABLE_SCHEMA = DATABASE()', 1, signal, options)
     return Number(result.rows[0]?.[0] ?? -1)
   }
-  const result = await adapter.query('SELECT pg_database_size(current_database())', 1, signal)
+  const result = await adapter.query('SELECT pg_database_size(current_database())', 1, signal, options)
   return Number(result.rows[0]?.[0] ?? -1)
 }
 
@@ -451,59 +382,102 @@ export interface SqlExecGateContext {
   signal?: unknown
 }
 
-/** 构建六个工具定义；adapters 惰性创建并按连接名缓存，支持静态配置或活引用 getter。 */
+const MAX_TABLE_RENDER_CHARS = 8000
+
+/** 构建六个工具定义；adapters 惰性创建并按小写连接名缓存，支持静态配置或活引用 getter。 */
 export function buildSqlTools(
   config: ResolvedSqlConfig | (() => ResolvedSqlConfig),
   policyOf: (execution: unknown) => 'ask' | 'never' | 'unknown' = () => 'unknown',
 ): { tools: SqlToolDefinition[]; adapters: Map<string, DatabaseAdapter> } {
   const getCfg = typeof config === 'function' ? config : () => config
-  const initialCfg = getCfg()
   const adapters = new Map<string, DatabaseAdapter>()
   const adapterFingerprints = new Map<string, string>()
 
-  /** 只解析连接配置（不建连接），用于在打开数据库前挑选词法规则。 */
-  const findConnection = (name: string | undefined): { cfg: ResolvedSqlConfig; connection: ResolvedSqlConfig['connections'][number] } => {
-    const cfg = getCfg()
+  const adapterFingerprint = (cfg: ResolvedSqlConfig, connection: SqlConnectionConfig): string => {
+    const effectiveReadOnly = cfg.readOnly || connection.readOnly === true
+    return JSON.stringify({ connection, effectiveReadOnly })
+  }
+
+  /**
+   * 同步适配器缓存：清理配置中已移除/改名，或连接参数/生效 readOnly 发生变更的旧连接池，
+   * 防止热更新后连接池或文件句柄泄漏。
+   */
+  const syncAdapters = (cfg: ResolvedSqlConfig): void => {
+    const active = new Map<string, string>()
+    for (const connection of cfg.connections) {
+      active.set(connection.name.toLowerCase(), adapterFingerprint(cfg, connection))
+    }
+    for (const [key, adapter] of [...adapters.entries()]) {
+      const nextFp = active.get(key)
+      const prevFp = adapterFingerprints.get(key)
+      if (nextFp === undefined || (prevFp !== undefined && prevFp !== nextFp)) {
+        adapters.delete(key)
+        adapterFingerprints.delete(key)
+        void adapter.close().catch(() => {})
+      }
+    }
+  }
+
+  const findConnectionIn = (cfg: ResolvedSqlConfig, name: string | undefined): SqlConnectionConfig => {
     const target = name ?? cfg.connections[0].name
     const connection = cfg.connections.find((item) => item.name.toLowerCase() === target.toLowerCase())
     if (connection === undefined) {
       throw new Error('未找到名为 ' + target + ' 的数据库连接。可用 sql_list 查看现有连接清单，或在 DSH「设置 → 插件 → 数据库（dsh-sql）」/ cordis.patch.yml 中添加该连接。')
     }
+    return connection
+  }
+
+  /** 只解析连接配置（不建连接），用于在打开数据库前挑选词法规则。 */
+  const findConnection = (name: string | undefined): { cfg: ResolvedSqlConfig; connection: SqlConnectionConfig } => {
+    const cfg = getCfg()
+    const connection = findConnectionIn(cfg, name)
     return { cfg, connection }
   }
 
-  const getAdapter = (name: string | undefined): { adapter: DatabaseAdapter; name: string; cfg: ResolvedSqlConfig } => {
-    const { cfg, connection } = findConnection(name)
-    const fp = JSON.stringify({ connection, readOnly: cfg.readOnly })
-    let adapter = adapters.get(connection.name)
-    if (adapter !== undefined && adapterFingerprints.get(connection.name) !== fp) {
-      void adapter.close().catch(() => {})
-      adapters.delete(connection.name)
-      adapter = undefined
-    }
+  const getAdapterFor = (cfg: ResolvedSqlConfig, connection: SqlConnectionConfig): DatabaseAdapter => {
+    syncAdapters(cfg)
+    const key = connection.name.toLowerCase()
+    const effectiveReadOnly = cfg.readOnly || connection.readOnly === true
+    const fp = adapterFingerprint(cfg, connection)
+    let adapter = adapters.get(key)
     if (adapter === undefined) {
-      adapter = createAdapter(connection, { readOnly: cfg.readOnly })
-      adapters.set(connection.name, adapter)
-      adapterFingerprints.set(connection.name, fp)
+      adapter = createAdapter(connection, { readOnly: effectiveReadOnly })
+      adapters.set(key, adapter)
+      adapterFingerprints.set(key, fp)
     }
-    return { adapter, name: connection.name, cfg }
+    return adapter
   }
 
-  /** 适配器调用统一兜底：被取消时原样抛出，其余错误补「下一步」。 */
-  const guard = async <T>(signal: AbortSignal | undefined, work: () => Promise<T>): Promise<T> => {
+  const getAdapter = (name: string | undefined): { adapter: DatabaseAdapter; name: string; cfg: ResolvedSqlConfig; connection: SqlConnectionConfig } => {
+    const { cfg, connection } = findConnection(name)
+    const adapter = getAdapterFor(cfg, connection)
+    return { adapter, name: connection.name, cfg, connection }
+  }
+
+  /** 适配器调用统一兜底：外部取消信号触发时原样抛出，其余错误（含超时）补「下一步」。 */
+  const guard = async <T>(outerSignal: AbortSignal | undefined, work: () => Promise<T>): Promise<T> => {
     try {
       return await work()
     } catch (error) {
-      signal?.throwIfAborted()
+      outerSignal?.throwIfAborted()
       throw annotateError(error)
     }
   }
 
-  const pingAllConnections = async (signal?: AbortSignal): Promise<{ cfg: ResolvedSqlConfig; rows: Array<Record<string, unknown>> }> => {
+  const pingAllConnections = async (outerSignal?: AbortSignal): Promise<{ cfg: ResolvedSqlConfig; rows: Array<Record<string, unknown>> }> => {
+    outerSignal?.throwIfAborted()
     const cfg = getCfg()
-    const rows: Array<Record<string, unknown>> = []
-    for (const connection of cfg.connections) {
-      const entry: Record<string, unknown> = { name: connection.name, engine: connection.engine }
+    syncAdapters(cfg)
+    const pingTimeoutMs = Math.max(1, Math.min(cfg.queryTimeoutMs, 8000))
+    const rows = await Promise.all(cfg.connections.map(async (connection) => {
+      const effectiveReadOnly = cfg.readOnly || connection.readOnly === true
+      const sslEnabled = Boolean(connection.ssl && connection.ssl !== 'disable')
+      const entry: Record<string, unknown> = {
+        name: connection.name,
+        engine: connection.engine,
+        readOnly: effectiveReadOnly,
+        ...(sslEnabled ? { ssl: true } : {}),
+      }
       if (connection.engine === 'sqlite') entry.file = connection.file ?? ':memory:'
       else {
         entry.host = connection.host ?? ''
@@ -511,25 +485,26 @@ export function buildSqlTools(
         entry.port = connection.port
         entry.database = connection.database ?? ''
       }
+      const pingSignal = withTimeoutSignal(outerSignal, pingTimeoutMs)
       try {
-        const { adapter } = getAdapter(connection.name)
-        await adapter.ping(signal)
+        const adapter = getAdapterFor(cfg, connection)
+        await adapter.ping(pingSignal)
         entry.ok = true
         entry.error = ''
       } catch (error) {
-        signal?.throwIfAborted()
+        outerSignal?.throwIfAborted()
         entry.ok = false
         entry.error = annotateError(error).message
       }
-      rows.push(entry)
-    }
+      return entry
+    }))
     return { cfg, rows }
   }
 
   const sqlList: SqlToolDefinition = {
     name: 'sql_list',
     isConcurrencySafe: () => true,
-    description: '列出配置的数据库连接并逐一做连通性测试（SELECT 1）。返回连接名、引擎、目标与健康状态。',
+    description: '列出配置的数据库连接并并发做连通性测试（SELECT 1）。返回连接名、引擎、目标、只读/SSL 状态与健康结果。',
     parameters: compileParameters({}),
     output: {
       schema: listSchema,
@@ -541,7 +516,11 @@ export function buildSqlTools(
         for (const item of connections) {
           const c = asRecord(item)
           const target = c.file !== undefined && c.file !== '' ? c.file : c.host + ':' + c.port + '/' + c.database
-          lines.push('- ' + c.name + '（' + c.engine + ' @ ' + target + '）' + (c.ok === true ? ' ✅' : ' ❌ ' + String(c.error ?? '')))
+          const tags: string[] = []
+          if (c.readOnly === true) tags.push('只读')
+          if (c.ssl === true) tags.push('SSL')
+          const tagSuffix = tags.length > 0 ? ' [' + tags.join(', ') + ']' : ''
+          lines.push('- ' + c.name + '（' + c.engine + ' @ ' + target + '）' + tagSuffix + (c.ok === true ? ' ✅' : ' ❌ ' + String(c.error ?? '')))
           if (c.ok !== true) bad.push(String(c.name))
         }
         if (bad.length > 0) {
@@ -562,26 +541,53 @@ export function buildSqlTools(
   const sqlQuery: SqlToolDefinition = {
     name: 'sql_query',
     isConcurrencySafe: () => true,
-    description: '执行只读 SQL 查询（SELECT / PRAGMA / EXPLAIN / SHOW / DESCRIBE / WITH）。词法级校验按引擎处理反斜杠转义，拒绝 data-modifying CTE、SELECT INTO、FOR UPDATE/FOR SHARE、非白名单 PRAGMA 与多语句。MySQL / PostgreSQL 每次查询使用独立只读事务并回滚，不受 readOnly 开关影响；PostgreSQL 还以扩展协议拒绝多命令。connection 为连接名（缺省第一个连接）。返回列名与行数据，最多 maxRows 行（超出 truncated=true）。写操作请用 sql_exec。',
+    description: '执行只读 SQL 查询（SELECT / PRAGMA / EXPLAIN / SHOW / DESCRIBE / WITH）。词法级校验按引擎处理反斜杠转义，拒绝 data-modifying CTE、SELECT INTO、FOR UPDATE/FOR SHARE、非白名单 PRAGMA 与多语句。支持 limit、参数化查询 params 与 table/csv/json 格式输出。MySQL / PostgreSQL 每次查询使用独立只读事务并回滚，不受 readOnly 开关影响；PostgreSQL 还以扩展协议拒绝多命令。connection 为连接名（缺省第一个连接）。写操作请用 sql_exec。',
     parameters: compileParameters({
       sql: { type: 'string', required: true, description: '只读 SQL 语句（必填，单条）。' },
       connection: { type: 'string', description: '连接名（可选，缺省第一个连接）。' },
-      format: { type: 'string', description: '输出格式：table（默认表格）/ csv / json。csv 与 json 会额外返回 formatted 文本，便于落盘或转存。' },
+      limit: { type: 'integer', minimum: 1, description: '本次最多返回行数（可选，不能超过全局 maxRows）。' },
+      params: { type: 'array', items: {}, description: '参数化查询绑定值数组（可选；SQLite/MySQL 用 ?，PostgreSQL 用 $1/$2）。' },
+      format: { type: 'string', enum: ['table', 'csv', 'json'], description: '输出格式：table（默认表格）/ csv / json。csv 与 json 会额外返回 formatted 文本，便于落盘或转存。' },
     }),
     output: {
       schema: querySchema,
       render: (_args, value) => {
         const rec = asRecord(value)
-        if (typeof rec.formatted === 'string' && rec.formatted !== '') {
+        const truncNote = rec.truncated === true
+          ? '（已达上限 ' + rec.maxRows + ' 行，实际结果更多，可加 WHERE/LIMIT 或用 COUNT(*)）'
+          : ''
+        if (typeof rec.formatted === 'string' && (rec.formatted !== '' || rec.format === 'csv' || rec.format === 'json')) {
           const preview = rec.formatted.length > 4000 ? rec.formatted.slice(0, 4000) + '\n…（预览已截断）' : rec.formatted
-          return [{ type: 'text', text: '查询返回 ' + rec.rowCount + ' 行（' + String(rec.format) + ' 格式）：\n' + preview }]
+          return [{ type: 'text', text: '查询返回 ' + rec.rowCount + ' 行（' + String(rec.format) + ' 格式）' + truncNote + '：\n' + preview }]
         }
         const rows = Array.isArray(rec.rows) ? rec.rows : []
-        const lines = ['查询返回 ' + rec.rowCount + ' 行' + (rec.truncated === true ? '（截断到 ' + rec.maxRows + ' 行）' : '') + '，列：' + (Array.isArray(rec.columns) ? rec.columns.join(', ') : '')]
+        const header = '查询返回 ' + rec.rowCount + ' 行' + truncNote + '，列：' + (Array.isArray(rec.columns) ? rec.columns.join(', ') : '')
+        const lines = [header]
+        let totalChars = header.length
+        let shown = 0
+        let charCapped = false
         for (const row of rows.slice(0, 20)) {
-          lines.push('- ' + (Array.isArray(row) ? row.map((cell) => String(cell)).join(' | ') : String(row)))
+          const line = '- ' + (Array.isArray(row) ? row.map((cell) => formatCell(cell)).join(' | ') : formatCell(row))
+          if (shown > 0 && totalChars + 1 + line.length > MAX_TABLE_RENDER_CHARS) {
+            charCapped = true
+            break
+          }
+          if (shown === 0 && totalChars + 1 + line.length > MAX_TABLE_RENDER_CHARS) {
+            const avail = Math.max(80, MAX_TABLE_RENDER_CHARS - totalChars - 16)
+            lines.push(line.slice(0, avail) + '…(已截断)')
+            shown += 1
+            charCapped = true
+            break
+          }
+          lines.push(line)
+          totalChars += 1 + line.length
+          shown += 1
         }
-        if (rows.length > 20) lines.push('…仅展示前 20 行')
+        if (charCapped) {
+          lines.push('…输出已达长度上限，仅展示前 ' + shown + ' 行（共 ' + rows.length + ' 行）')
+        } else if (rows.length > 20) {
+          lines.push('…仅展示前 20 行')
+        }
         return [{ type: 'text', text: lines.join('\n') }]
       },
     },
@@ -589,20 +595,30 @@ export function buildSqlTools(
       const args = asRecord(rawArgs)
       const rawSql = requiredString(args, 'sql', 'SQL 语句')
       const connectionName = optionalString(args, 'connection')
-      // 先按目标连接的引擎做词法校验，再打开数据库：被拒绝的 SQL 不该去建连接或建库文件。
-      const sql = assertReadQuery(rawSql, findConnection(connectionName).connection.engine)
-      const { adapter, name, cfg } = getAdapter(connectionName)
-      const result = await guard(executionSignal(exec), () => adapter.query(sql, cfg.maxRows + 1, executionSignal(exec)))
-      const total = result.rows.length
-      const rows = result.rows.slice(0, cfg.maxRows)
-      const format = optionalString(args, 'format')?.toLowerCase() ?? 'table'
+      const requestedLimit = optionalPositiveInteger(args, 'limit')
+      const params = optionalParams(args)
+      const format = parseQueryFormat(args)
+      // 单次解析连接与配置，先按目标引擎做词法校验，再打开数据库（避免 TOCTOU 与无效建库）。
+      const { cfg, connection } = findConnection(connectionName)
+      const sql = assertReadQuery(rawSql, connection.engine)
+      const effectiveLimit = requestedLimit !== undefined ? Math.min(cfg.maxRows, requestedLimit) : cfg.maxRows
+      const outerSignal = executionSignal(exec)
+      const signal = withTimeoutSignal(outerSignal, cfg.queryTimeoutMs)
+      const adapter = getAdapterFor(cfg, connection)
+      const queryOptions: QueryOptions = {
+        ...(params !== undefined ? { params } : {}),
+        timeoutMs: cfg.queryTimeoutMs,
+      }
+      const result = await guard(outerSignal, () => adapter.query(sql, effectiveLimit + 1, signal, queryOptions))
+      const truncated = result.rows.length > effectiveLimit
+      const rows = result.rows.slice(0, effectiveLimit)
       const base = {
-        connection: name,
+        connection: connection.name,
         columns: result.columns,
         rows,
-        rowCount: total,
-        truncated: total > cfg.maxRows,
-        maxRows: cfg.maxRows,
+        rowCount: rows.length,
+        truncated,
+        maxRows: effectiveLimit,
       }
       if (format === 'csv') return { ...base, format, formatted: toCsv(result.columns, rows) }
       if (format === 'json') {
@@ -614,15 +630,18 @@ export function buildSqlTools(
       }
       return base
     },
-    timeoutMs: initialCfg.queryTimeoutMs,
+    get timeoutMs() {
+      return getCfg().queryTimeoutMs
+    },
   }
 
   const sqlExec: SqlToolDefinition = {
     name: 'sql_exec',
-    description: '执行写操作或 DDL（INSERT / UPDATE / DELETE / CREATE / ALTER / DROP 等，可多语句脚本）。受 readOnly 模式与写审批门双重保护。返回影响行数（多语句时为 0）。',
+    description: '执行写操作或 DDL（INSERT / UPDATE / DELETE / CREATE / ALTER / DROP 等，支持参数化 params 与多语句脚本）。受全局/单连接 readOnly 模式与写审批门双重保护。返回影响行数。',
     parameters: compileParameters({
       sql: { type: 'string', required: true, description: '写操作/DDL SQL（必填）。' },
       connection: { type: 'string', description: '连接名（可选，缺省第一个连接）。' },
+      params: { type: 'array', items: {}, description: '参数化写入绑定值数组（可选；SQLite/MySQL 用 ?，PostgreSQL 用 $1/$2）。' },
     }),
     output: {
       schema: execSchema,
@@ -635,23 +654,40 @@ export function buildSqlTools(
     },
     async execute(rawArgs: unknown, exec: unknown) {
       const currentCfg = getCfg()
-      if (currentCfg.readOnly) throw new Error('当前配置 readOnly=true，sql_exec 已被禁用。需要写操作请在 DSH「设置 → 插件 → 数据库（dsh-sql）」把 readOnly 改为 false（保存即生效），或修改 cordis.patch.yml。')
+      if (currentCfg.readOnly) {
+        throw new Error('当前全局配置 readOnly=true，sql_exec 已被禁用。需要写操作请在 DSH「设置 → 插件 → 数据库（dsh-sql）」把 readOnly 改为 false（保存即生效），或修改 cordis.patch.yml。')
+      }
       const args = asRecord(rawArgs)
       const sql = requiredString(args, 'sql', 'SQL 语句')
-      const { adapter, name } = getAdapter(optionalString(args, 'connection'))
-      const changes = await guard(executionSignal(exec), () => adapter.exec(sql, executionSignal(exec)))
-      return { connection: name, changes, readOnly: false }
+      const params = optionalParams(args)
+      const connection = findConnectionIn(currentCfg, optionalString(args, 'connection'))
+      if (connection.readOnly === true) {
+        throw new Error('连接 ' + connection.name + ' 配置了单连接只读锁（readOnly=true），sql_exec 已被禁用。需要写操作请在连接配置中将其 readOnly 改为 false。')
+      }
+      const outerSignal = executionSignal(exec)
+      const signal = withTimeoutSignal(outerSignal, currentCfg.execTimeoutMs)
+      const adapter = getAdapterFor(currentCfg, connection)
+      const execOptions: ExecOptions = {
+        ...(params !== undefined ? { params } : {}),
+        timeoutMs: currentCfg.execTimeoutMs,
+      }
+      const changes = await guard(outerSignal, () => adapter.exec(sql, signal, execOptions))
+      return { connection: connection.name, changes, readOnly: false }
     },
-    timeoutMs: initialCfg.execTimeoutMs,
+    get timeoutMs() {
+      return getCfg().execTimeoutMs
+    },
   }
 
   const sqlSchema: SqlToolDefinition = {
     name: 'sql_schema',
     isConcurrencySafe: () => true,
-    description: '查看数据库结构：不给 table 列出全部表；给 table（表名）返回该表的列信息（名称/类型/非空/主键）。',
+    description: '查看数据库结构：不给 table 列出表清单（可用 schema / pattern 过滤）；给 table（支持 schema.table）返回该表的列（类型/非空/主键/默认值/注释）、索引与外键信息。',
     parameters: compileParameters({
-      table: { type: 'string', description: '表名（可选；缺省列出全部表）。' },
+      table: { type: 'string', description: '表名（可选；支持 schema.table；缺省列出全部表）。' },
       connection: { type: 'string', description: '连接名（可选，缺省第一个连接）。' },
+      schema: { type: 'string', description: 'Schema 名称（可选；PostgreSQL 可按指定 schema 过滤表清单或限定表名）。' },
+      pattern: { type: 'string', description: '表名过滤模式（可选，不带 table 时生效；支持不区分大小写子串或 * 通配符）。' },
     }),
     output: {
       schema: schemaToolSchema,
@@ -660,18 +696,53 @@ export function buildSqlTools(
         const columns = Array.isArray(rec.columns) ? rec.columns : []
         // 指定了 table 却没有列：不能落到「共 0 张表」，那会把「表不存在」说成「库是空的」。
         if (typeof rec.table === 'string' && rec.table !== '') {
+          const displayTable = typeof rec.schema === 'string' && rec.schema !== '' && !rec.table.startsWith(rec.schema + '.')
+            ? rec.schema + '.' + rec.table
+            : rec.table
           if (columns.length === 0) {
-            return [{ type: 'text', text: '没有取到表 ' + rec.table + ' 的列：该表可能不存在、大小写/Schema 不匹配，或当前账号没有读取权限。\n下一步：先调用 sql_schema（不带 table）查看连接 ' + rec.connection + ' 的表清单，再用清单里的原名重试。' }]
+            return [{ type: 'text', text: '没有取到表 ' + displayTable + ' 的列：该表可能不存在、大小写/Schema 不匹配，或当前账号没有读取权限。\n下一步：先调用 sql_schema（不带 table）查看连接 ' + rec.connection + ' 的表清单，再用清单里的原名重试。' }]
           }
-          const lines = ['表 ' + rec.table + ' 的列：']
+          const tableComment = typeof rec.comment === 'string' && rec.comment.trim() !== '' ? '（' + rec.comment.trim() + '）' : ''
+          const lines = ['表 ' + displayTable + tableComment + ' 的列：']
           for (const item of columns) {
             const c = asRecord(item)
-            lines.push('- ' + c.name + ' ' + c.type + (c.primaryKey === true ? '（主键）' : '') + (c.notNull === true ? '（非空）' : ''))
+            const attrs: string[] = []
+            if (c.primaryKey === true) attrs.push('主键')
+            if (c.notNull === true) attrs.push('非空')
+            if (c.defaultValue !== undefined && c.defaultValue !== null && String(c.defaultValue) !== '') {
+              attrs.push('默认: ' + String(c.defaultValue))
+            }
+            const attrText = attrs.length > 0 ? '（' + attrs.join('，') + '）' : ''
+            const colComment = typeof c.comment === 'string' && c.comment.trim() !== '' ? ' — ' + c.comment.trim() : ''
+            lines.push('- ' + c.name + ' ' + c.type + attrText + colComment)
+          }
+          const indexes = Array.isArray(rec.indexes) ? rec.indexes : []
+          if (indexes.length > 0) {
+            lines.push('', '索引（' + indexes.length + '）：')
+            for (const item of indexes) {
+              const idx = asRecord(item)
+              const cols = Array.isArray(idx.columns) ? idx.columns.map(String).join(', ') : ''
+              lines.push('- ' + String(idx.name ?? '') + (idx.unique === true ? '（UNIQUE）' : '') + ' (' + cols + ')')
+            }
+          }
+          const foreignKeys = Array.isArray(rec.foreignKeys) ? rec.foreignKeys : []
+          if (foreignKeys.length > 0) {
+            lines.push('', '外键（' + foreignKeys.length + '）：')
+            for (const item of foreignKeys) {
+              const fk = asRecord(item)
+              lines.push('- ' + String(fk.column ?? '') + ' -> ' + String(fk.refTable ?? '') + '.' + String(fk.refColumn ?? ''))
+            }
           }
           return [{ type: 'text', text: lines.join('\n') }]
         }
         const tables = Array.isArray(rec.tables) ? rec.tables : []
         if (tables.length === 0) {
+          const filters: string[] = []
+          if (typeof rec.schema === 'string' && rec.schema !== '') filters.push('schema=' + rec.schema)
+          if (typeof rec.pattern === 'string' && rec.pattern !== '') filters.push('pattern=' + rec.pattern)
+          if (filters.length > 0) {
+            return [{ type: 'text', text: '连接 ' + rec.connection + ' 中没有匹配的表（过滤条件：' + filters.join('，') + '）。' }]
+          }
           if (rec.implicitMemoryDefault === true) {
             return [{ type: 'text', text: '连接 ' + rec.connection + ' 里没有用户表（当前尚未配置外部数据库，正在使用内置临时内存库 :memory:。请在 DSH「设置 → 插件 → 数据库（dsh-sql）」添加你的 SQLite / MySQL / PostgreSQL 连接，保存即生效；或在 cordis.patch.yml 配置）。' }]
           }
@@ -682,15 +753,41 @@ export function buildSqlTools(
     },
     async execute(rawArgs: unknown, exec: unknown) {
       const args = asRecord(rawArgs)
-      const { adapter, name, cfg } = getAdapter(optionalString(args, 'connection'))
       const table = optionalString(args, 'table')
-      const signal = executionSignal(exec)
-      if (table !== undefined) {
-        const columns = await guard(signal, () => adapter.describeTable(table, signal))
-        return { connection: name, table, columns, tables: [] }
+      const schemaName = optionalString(args, 'schema')
+      const pattern = optionalString(args, 'pattern')
+      const tableRef = table !== undefined ? qualifyTableRef(table, schemaName) : undefined
+      if (table === undefined && schemaName !== undefined) parseSingleSchema(schemaName)
+      const { adapter, name, cfg } = getAdapter(optionalString(args, 'connection'))
+      const outerSignal = executionSignal(exec)
+      const signal = withTimeoutSignal(outerSignal, 30000)
+      if (tableRef !== undefined && table !== undefined) {
+        if (typeof adapter.describeTableDetail === 'function') {
+          const detail = await guard(outerSignal, () => adapter.describeTableDetail!(tableRef, signal))
+          return {
+            connection: name,
+            table: detail.table || table,
+            ...(detail.schema !== undefined ? { schema: detail.schema } : {}),
+            ...(detail.comment !== undefined && detail.comment !== null && detail.comment !== '' ? { comment: detail.comment } : {}),
+            columns: detail.columns,
+            indexes: detail.indexes,
+            foreignKeys: detail.foreignKeys,
+            tables: [],
+          }
+        }
+        const columns = await guard(outerSignal, () => adapter.describeTable(tableRef, signal))
+        return { connection: name, table, columns, indexes: [], foreignKeys: [], tables: [] }
       }
-      const tables = await guard(signal, () => adapter.listTables(signal))
-      return { connection: name, tables, columns: [], ...(cfg.implicitMemoryDefault ? { implicitMemoryDefault: true } : {}) }
+      const allTables = await guard(outerSignal, () => adapter.listTables(signal, schemaName))
+      const tables = filterTablesByPattern(allTables, pattern)
+      return {
+        connection: name,
+        ...(schemaName !== undefined ? { schema: schemaName } : {}),
+        ...(pattern !== undefined ? { pattern } : {}),
+        tables,
+        columns: [],
+        ...(cfg.implicitMemoryDefault ? { implicitMemoryDefault: true } : {}),
+      }
     },
     timeoutMs: 30000,
   }
@@ -698,7 +795,7 @@ export function buildSqlTools(
   const sqlStats: SqlToolDefinition = {
     name: 'sql_stats',
     isConcurrencySafe: () => true,
-    description: '数据库概览统计：表数量、每张表的行数、库体积（SQLite 按页计算，MySQL/PostgreSQL 走系统表）。connection 为连接名（缺省第一个连接）。适合在写查询前先了解数据规模。',
+    description: '数据库概览统计：表数量、每张表的行数与占用体积、库总体积（SQLite 按页计算，MySQL/PostgreSQL 走系统表）。connection 为连接名（缺省第一个连接）。适合在写查询前先了解数据规模。',
     parameters: compileParameters({
       connection: { type: 'string', description: '连接名（可选，缺省第一个连接）。' },
     }),
@@ -711,7 +808,11 @@ export function buildSqlTools(
         for (const item of tables.slice(0, 30)) {
           const t = asRecord(item)
           const label = typeof t.name === 'string' && t.name !== '' ? t.name : '（表清单读取失败）'
-          lines.push('- ' + label + '：' + (typeof t.rowCount === 'number' ? t.rowCount + ' 行' : '行数未知' + (t.error ? '（' + t.error + '）' : '')))
+          const rowText = typeof t.rowCount === 'number'
+            ? (t.estimated === true ? '约 ' : '') + t.rowCount + ' 行'
+            : '行数未知' + (t.error ? '（' + t.error + '）' : '')
+          const sizeText = typeof t.sizeBytes === 'number' && t.sizeBytes >= 0 ? '，' + formatBytes(t.sizeBytes) : ''
+          lines.push('- ' + label + '：' + rowText + sizeText)
         }
         if (tables.length > 0 && tables.every((item) => typeof asRecord(item).rowCount !== 'number') && tables.every((item) => asRecord(item).error !== undefined)) {
           lines.push('', '下一步：统计信息读不到时，先用 sql_schema 确认表清单可用、账号有读取系统表/information_schema 的权限，再用 sql_query 手动 COUNT(*)。')
@@ -722,51 +823,111 @@ export function buildSqlTools(
     },
     async execute(rawArgs: unknown, exec: unknown) {
       const args = asRecord(rawArgs)
-      const { adapter, name } = getAdapter(optionalString(args, 'connection'))
+      const { adapter, name, cfg } = getAdapter(optionalString(args, 'connection'))
       const engine = adapter.engine
-      const signal = executionSignal(exec)
+      const outerSignal = executionSignal(exec)
+      const signal = withTimeoutSignal(outerSignal, cfg.queryTimeoutMs)
+      const queryOptions: QueryOptions = { timeoutMs: cfg.queryTimeoutMs }
       let sizeBytes = -1
       try {
-        sizeBytes = await databaseSize(adapter, engine, signal)
+        sizeBytes = await databaseSize(adapter, engine, signal, cfg.queryTimeoutMs)
       } catch {
-        signal?.throwIfAborted()
+        outerSignal?.throwIfAborted()
+        if (signal.aborted) throw annotateError(signal.reason)
         sizeBytes = -1
       }
       const tables: Array<Record<string, unknown>> = []
-      if (engine === 'mysql' || engine === 'postgres') {
+      if (engine === 'mysql') {
         try {
-          const sql = engine === 'mysql'
-            ? 'SELECT TABLE_NAME, TABLE_ROWS FROM information_schema.tables WHERE TABLE_SCHEMA = DATABASE()'
-            : 'SELECT relname, n_live_tup FROM pg_stat_user_tables ORDER BY relname'
-          const result = await adapter.query(sql, undefined, signal)
+          const sql = "SELECT TABLE_NAME, TABLE_ROWS, (DATA_LENGTH + INDEX_LENGTH) AS total_bytes FROM information_schema.tables WHERE TABLE_SCHEMA = DATABASE() AND TABLE_TYPE = 'BASE TABLE' ORDER BY TABLE_NAME"
+          const result = await adapter.query(sql, undefined, signal, queryOptions)
           for (const row of result.rows) {
-            tables.push({ name: String(row[0]), rowCount: typeof row[1] === 'number' ? row[1] : Number(row[1] ?? 0) })
+            const totalBytes = row[2] !== null && row[2] !== undefined ? Number(row[2]) : undefined
+            tables.push({
+              name: String(row[0]),
+              rowCount: typeof row[1] === 'number' ? row[1] : Number(row[1] ?? 0),
+              ...(totalBytes !== undefined && Number.isFinite(totalBytes) && totalBytes >= 0 ? { sizeBytes: totalBytes } : {}),
+            })
           }
         } catch (error) {
-          signal?.throwIfAborted()
+          outerSignal?.throwIfAborted()
+          if (signal.aborted) throw annotateError(signal.reason)
+          tables.push({ name: '', error: error instanceof Error ? error.message : String(error) })
+        }
+      } else if (engine === 'postgres') {
+        try {
+          const sql = 'SELECT schemaname, relname, n_live_tup, pg_total_relation_size(relid) AS total_bytes FROM pg_stat_user_tables ORDER BY schemaname, relname'
+          const result = await adapter.query(sql, undefined, signal, queryOptions)
+          for (const row of result.rows) {
+            const schemaName = String(row[0] ?? '')
+            const relName = String(row[1] ?? '')
+            const tableName = schemaName === '' || schemaName === 'public' ? relName : schemaName + '.' + relName
+            const totalBytes = row[3] !== null && row[3] !== undefined ? Number(row[3]) : undefined
+            tables.push({
+              name: tableName,
+              rowCount: typeof row[2] === 'number' ? row[2] : Number(row[2] ?? 0),
+              ...(totalBytes !== undefined && Number.isFinite(totalBytes) && totalBytes >= 0 ? { sizeBytes: totalBytes } : {}),
+            })
+          }
+        } catch (error) {
+          outerSignal?.throwIfAborted()
+          if (signal.aborted) throw annotateError(signal.reason)
           tables.push({ name: '', error: error instanceof Error ? error.message : String(error) })
         }
       } else {
-        const names = await guard(signal, () => adapter.listTables(signal))
-        for (const table of names) {
+        const names = await guard(outerSignal, () => adapter.listTables(signal))
+        // 表数量极大（>200）时优先读取 sqlite_stat1 估计值，避免长时间阻塞事件循环；正常表数保持精确 COUNT(*)。
+        let statEstimates: Map<string, number> | undefined
+        if (names.length > 200) {
           try {
-            const result = await adapter.query('SELECT COUNT(*) FROM ' + quoteIdent(engine, table), 1, signal)
+            const statResult = await adapter.query('SELECT tbl, stat FROM sqlite_stat1', undefined, signal, queryOptions)
+            statEstimates = new Map<string, number>()
+            for (const row of statResult.rows) {
+              const tbl = String(row[0] ?? '')
+              const firstNum = Number(String(row[1] ?? '').trim().split(/\s+/)[0])
+              if (tbl !== '' && Number.isFinite(firstNum) && !statEstimates.has(tbl)) {
+                statEstimates.set(tbl, firstNum)
+              }
+            }
+          } catch {
+            outerSignal?.throwIfAborted()
+            if (signal.aborted) throw annotateError(signal.reason)
+            statEstimates = undefined
+          }
+        }
+        for (let idx = 0; idx < names.length; idx += 1) {
+          if (idx > 0) {
+            await new Promise<void>((resolve) => setImmediate(resolve))
+            outerSignal?.throwIfAborted()
+            if (signal.aborted) throw annotateError(signal.reason)
+          }
+          const table = names[idx]
+          const estimated = statEstimates?.get(table)
+          if (estimated !== undefined) {
+            tables.push({ name: table, rowCount: estimated, estimated: true })
+            continue
+          }
+          try {
+            const result = await adapter.query('SELECT COUNT(*) FROM ' + quoteIdent(engine, table), 1, signal, queryOptions)
             tables.push({ name: table, rowCount: Number(result.rows[0]?.[0] ?? 0) })
           } catch (error) {
-            signal?.throwIfAborted()
+            outerSignal?.throwIfAborted()
+            if (signal.aborted) throw annotateError(signal.reason)
             tables.push({ name: table, error: error instanceof Error ? error.message : String(error) })
           }
         }
       }
       return { connection: name, engine, tableCount: tables.filter((t) => t.name !== '').length, tables, sizeBytes }
     },
-    timeoutMs: initialCfg.queryTimeoutMs,
+    get timeoutMs() {
+      return getCfg().queryTimeoutMs
+    },
   }
 
   const sqlHealth: SqlToolDefinition = {
     name: 'sql_health',
     isConcurrencySafe: () => true,
-    description: 'dsh-sql 自检：逐个连接做连通性测试，并汇总安全配置（只读模式、写审批门、行数上限、超时）。遇到问题时先运行本工具定位。',
+    description: 'dsh-sql 自检：并发做连通性测试，并汇总安全配置（只读模式、写审批门、行数上限、超时）。遇到问题时先运行本工具定位。',
     parameters: compileParameters({}),
     output: {
       schema: healthSchema,
@@ -777,7 +938,11 @@ export function buildSqlTools(
         const lines = ['dsh-sql 自检' + (rec.ok === true ? '：正常。' : '：发现问题。')]
         for (const item of connections) {
           const c = asRecord(item)
-          lines.push('- ' + c.name + '（' + c.engine + '）' + (c.ok === true ? ' ✅' : ' ❌ ' + String(c.error ?? '')))
+          const tags: string[] = []
+          if (c.readOnly === true) tags.push('只读')
+          if (c.ssl === true) tags.push('SSL')
+          const tagSuffix = tags.length > 0 ? ' [' + tags.join(', ') + ']' : ''
+          lines.push('- ' + c.name + '（' + c.engine + '）' + tagSuffix + (c.ok === true ? ' ✅' : ' ❌ ' + String(c.error ?? '')))
         }
         lines.push('- 只读模式：' + (rec.readOnly === true ? '开（sql_exec 已禁用）' : '关'))
         lines.push('- 写审批门：' + String(rec.writeApprovalDetail ?? (rec.writeApproval === true ? '开' : '关')))

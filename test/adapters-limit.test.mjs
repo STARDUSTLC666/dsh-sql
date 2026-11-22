@@ -1,12 +1,15 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import MysqlQuery from '../node_modules/mysql2/lib/commands/query.js'
 import pg from 'pg'
-import { createAdapter } from '../lib/index.js'
+import { createAdapter, mysqlPoolConfig, postgresPoolConfig } from '../lib/index.js'
 
 function pgFixture(values, { fail = false, stall = false, columns = ['a'], failControl } = {}) {
   const adapter = createAdapter({ name: 'pg', engine: 'postgres', database: 'app' })
-  const state = { released: [], produced: 0, query: undefined, commands: [] }
+  const state = { released: [], produced: 0, query: undefined, commands: [], lastQueryConfig: undefined }
   adapter.pool = {
     async connect() {
       return {
@@ -14,10 +17,14 @@ function pgFixture(values, { fail = false, stall = false, columns = ['a'], failC
         query(query) {
           state.commands.push(typeof query === 'string' ? query : query.text)
           if (typeof query === 'string') {
-            assert.ok(['BEGIN READ ONLY', 'ROLLBACK'].includes(query))
+            assert.ok(['BEGIN READ ONLY', 'ROLLBACK'].includes(query) || /^SET LOCAL statement_timeout = \d+$/.test(query), 'unexpected control command: ' + query)
             return query === failControl ? Promise.reject(new Error('control failed: ' + query)) : Promise.resolve({})
           }
-          if (!(query instanceof pg.Query)) return Promise.resolve({ fields: columns.map(name => ({ name })), rows: values.map(value => Array.isArray(value) ? value : [value]) })
+          state.lastQueryConfig = query
+          if (!(query instanceof pg.Query)) {
+            if (fail) return Promise.reject(new Error('pg query failed'))
+            return Promise.resolve({ fields: columns.map(name => ({ name })), rows: values.map(value => Array.isArray(value) ? value : [value]) })
+          }
           assert.ok(query instanceof pg.Query)
           state.query = query
           queueMicrotask(() => {
@@ -53,7 +60,7 @@ test('PostgreSQL：真实 pg.Query 行事件在上限结束，内部不累计结
 
 function mysqlFixture(values, { fail = false, stall = false, columns = ['a'], failControl } = {}) {
   const adapter = createAdapter({ name: 'my', engine: 'mysql', database: 'app' })
-  const state = { destroyed: false, released: false, produced: 0, commands: [] }
+  const state = { destroyed: false, released: false, produced: 0, commands: [], lastQueryOptions: undefined }
   adapter.pool = {
     async getConnection() {
       return {
@@ -65,11 +72,14 @@ function mysqlFixture(values, { fail = false, stall = false, columns = ['a'], fa
             assert.ok(['START TRANSACTION READ ONLY', 'ROLLBACK'].includes(query))
             return query === failControl ? Promise.reject(new Error('control failed: ' + query)) : Promise.resolve([[], []])
           }
+          state.lastQueryOptions = query
+          if (fail) return Promise.reject(new Error('mysql query failed'))
           return Promise.resolve([values.map(value => Array.isArray(value) ? value : [value]), columns.map(name => ({ name }))])
         },
         connection: {
           query(sql) {
             state.commands.push(sql.sql)
+            state.lastQueryOptions = sql
             const query = new MysqlQuery({ sql })
             let paused = false
             let ended = false
@@ -199,6 +209,36 @@ test('查询结果 bigint：安全整数转 number，超出安全范围转十进
   assert.doesNotThrow(() => JSON.stringify(result))
 })
 
+test('查询结果 Uint8Array / Buffer：短二进制转 0x 十六进制，大二进制输出紧凑摘要', async () => {
+  const small = new Uint8Array([0xde, 0xad, 0xbe, 0xef])
+  const empty = new Uint8Array(0)
+  const sliced = new Uint8Array([0x00, 0xaa, 0xbb, 0xff]).subarray(1, 3)
+  const boundary64 = Buffer.alloc(64, 0x0f)
+  const large = Buffer.alloc(200, 0xab)
+
+  const adapter = createAdapter({ name: 'pg', engine: 'postgres', database: 'app' })
+  adapter.pool = {
+    async connect() {
+      return {
+        release() {},
+        async query(q) {
+          if (typeof q === 'string') return {}
+          return {
+            fields: [{ name: 'small' }, { name: 'empty' }, { name: 'sliced' }, { name: 'b64' }, { name: 'large' }],
+            rows: [[small, empty, sliced, boundary64, large]],
+          }
+        },
+      }
+    },
+  }
+  const result = await adapter.query('SELECT small, empty, sliced, b64, large FROM blobs')
+  assert.equal(result.rows[0][0], '0xdeadbeef')
+  assert.equal(result.rows[0][1], '0x')
+  assert.equal(result.rows[0][2], '0xaabb')
+  assert.equal(result.rows[0][3], '0x' + '0f'.repeat(64))
+  assert.equal(result.rows[0][4], '<BLOB 200 bytes, hex: 0x' + 'ab'.repeat(16) + '...>')
+})
+
 test('MySQL：取消信号销毁专用连接，不把取消后的连接放回池', async () => {
   const adapter = createAdapter({ name: 'my', engine: 'mysql', database: 'app' })
   let destroyed = false
@@ -253,12 +293,17 @@ test('MySQL / PostgreSQL：查询独立只读，成功或查询错误后回滚�
   }
 })
 
-test('MySQL / PostgreSQL：只读事务建立失败时不运行用户查询，回滚失败时销毁连接', async () => {
+test('MySQL / PostgreSQL：只读事务建立失败时不发多余 ROLLBACK 且销毁连接，回滚失败时销毁连接', async () => {
   for (const makeFixture of [mysqlFixture, pgFixture]) {
     const begin = makeFixture === mysqlFixture ? 'START TRANSACTION READ ONLY' : 'BEGIN READ ONLY'
     const setup = makeFixture([1], { failControl: begin })
     await assert.rejects(setup.adapter.query('SELECT a FROM t', 10), /control failed/)
-    assert.deepEqual(setup.state.commands, [begin, 'ROLLBACK'])
+    assert.deepEqual(setup.state.commands, [begin])
+    if (makeFixture === mysqlFixture) {
+      assert.equal(setup.state.destroyed, true)
+      assert.equal(setup.state.released, false)
+    } else assert.deepEqual(setup.state.released, [true])
+
     const cleanup = makeFixture([1], { failControl: 'ROLLBACK' })
     await assert.rejects(cleanup.adapter.query('SELECT a FROM t', 10), /control failed/)
     if (makeFixture === mysqlFixture) {
@@ -266,6 +311,221 @@ test('MySQL / PostgreSQL：只读事务建立失败时不运行用户查询，�
       assert.equal(cleanup.state.released, false)
     } else assert.deepEqual(cleanup.state.released, [true])
   }
+})
+
+test('MySQL / PostgreSQL：查询失败后 ROLLBACK 也失败时绝不掩盖主错误，并销毁连接', async () => {
+  for (const makeFixture of [mysqlFixture, pgFixture]) {
+    for (const limit of [undefined, 10]) {
+      const { adapter, state } = makeFixture([], { fail: true, failControl: 'ROLLBACK' })
+      await assert.rejects(adapter.query('SELECT broken', limit), /query failed/)
+      if (makeFixture === mysqlFixture) {
+        assert.equal(state.destroyed, true)
+        assert.equal(state.released, false)
+      } else {
+        assert.deepEqual(state.released, [true])
+      }
+    }
+  }
+})
+
+test('PostgreSQL：真实 pg.Pool 创建时立即挂载 error 监听器，空闲断连不会抛未捕获异常', async () => {
+  const adapter = createAdapter({ name: 'pg-idle', engine: 'postgres', host: '127.0.0.1', port: 1, database: 'app' })
+  try {
+    const pool = await adapter.getPool()
+    assert.ok(pool instanceof pg.Pool)
+    assert.ok(pool.listenerCount('error') >= 1, 'pg.Pool must have idle error listener')
+    assert.doesNotThrow(() => pool.emit('error', new Error('idle disconnect')))
+  } finally {
+    await adapter.close()
+  }
+})
+
+test('mysqlPoolConfig / postgresPoolConfig：超时默认值与 SSL 选项映射', () => {
+  const baseMysql = mysqlPoolConfig({ name: 'm', engine: 'mysql', database: 'app' })
+  assert.equal(baseMysql.connectTimeout, 10000)
+  assert.equal(baseMysql.multipleStatements, false)
+  assert.equal(baseMysql.ssl, undefined)
+
+  const basePg = postgresPoolConfig({ name: 'p', engine: 'postgres', database: 'app' })
+  assert.equal(basePg.connectionTimeoutMillis, 10000)
+  assert.equal(basePg.ssl, undefined)
+
+  for (const disabled of [false, 'disable']) {
+    assert.equal(mysqlPoolConfig({ name: 'm', engine: 'mysql', database: 'app', ssl: disabled }).ssl, undefined)
+    assert.equal(postgresPoolConfig({ name: 'p', engine: 'postgres', database: 'app', ssl: disabled }).ssl, undefined)
+  }
+
+  for (const relaxed of [true, 'require']) {
+    assert.deepEqual(mysqlPoolConfig({ name: 'm', engine: 'mysql', database: 'app', ssl: relaxed }).ssl, { rejectUnauthorized: false })
+    assert.deepEqual(postgresPoolConfig({ name: 'p', engine: 'postgres', database: 'app', ssl: relaxed }).ssl, { rejectUnauthorized: false })
+  }
+
+  assert.deepEqual(mysqlPoolConfig({ name: 'm', engine: 'mysql', database: 'app', ssl: 'verify-full' }).ssl, { rejectUnauthorized: true })
+  assert.deepEqual(postgresPoolConfig({ name: 'p', engine: 'postgres', database: 'app', ssl: 'verify-full' }).ssl, { rejectUnauthorized: true })
+
+  const pem = '-----BEGIN CERTIFICATE-----\nMIIBFAKE\n-----END CERTIFICATE-----\n'
+  assert.deepEqual(
+    postgresPoolConfig({ name: 'p', engine: 'postgres', database: 'app', ssl: { rejectUnauthorized: true, ca: pem } }).ssl,
+    { rejectUnauthorized: true, ca: pem },
+  )
+
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-sql-ssl-'))
+  try {
+    const caPath = join(dir, 'ca.pem')
+    writeFileSync(caPath, pem, 'utf8')
+    assert.deepEqual(
+      mysqlPoolConfig({ name: 'm', engine: 'mysql', database: 'app', ssl: { ca: caPath } }).ssl,
+      { ca: pem },
+    )
+    assert.deepEqual(
+      postgresPoolConfig({ name: 'p', engine: 'postgres', database: 'app', ssl: { rejectUnauthorized: true, ca: caPath } }).ssl,
+      { rejectUnauthorized: true, ca: pem },
+    )
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('PostgreSQL / MySQL：query 传递 timeoutMs 与 params 参数', async () => {
+  for (const limit of [undefined, 10]) {
+    const pgFix = pgFixture([42])
+    const pgRes = await pgFix.adapter.query('SELECT $1::int AS a', limit, undefined, { params: [42], timeoutMs: 5000 })
+    assert.deepEqual(pgRes.rows, [[42]])
+    assert.deepEqual(pgFix.state.commands, ['BEGIN READ ONLY', 'SET LOCAL statement_timeout = 5000', 'SELECT $1::int AS a', 'ROLLBACK'])
+    assert.deepEqual(pgFix.state.lastQueryConfig.values, [42])
+
+    const myFix = mysqlFixture([42])
+    const myRes = await myFix.adapter.query('SELECT ? AS a', limit, undefined, { params: [42], timeoutMs: 5000 })
+    assert.deepEqual(myRes.rows, [[42]])
+    assert.deepEqual(myFix.state.lastQueryOptions.values, [42])
+    assert.equal(myFix.state.lastQueryOptions.timeout, 5000)
+  }
+})
+
+test('MySQL：exec 单语句、多语句切分事务与回滚、参数化校验', async () => {
+  const adapter = createAdapter({ name: 'my', engine: 'mysql', database: 'app' })
+  const poolCalls = []
+  const connLog = []
+  let failOnSql
+  let failRollback = false
+  let destroyed = false
+  let released = false
+
+  adapter.pool = {
+    async query(q) {
+      poolCalls.push(q)
+      return [{ affectedRows: 1 }, []]
+    },
+    async getConnection() {
+      destroyed = false
+      released = false
+      return {
+        destroy() { destroyed = true },
+        release() { released = true },
+        async query(q) {
+          const text = typeof q === 'string' ? q : q.sql
+          connLog.push(q)
+          if (text === 'ROLLBACK' && failRollback) throw new Error('rollback boom')
+          if (failOnSql && text.includes(failOnSql)) throw new Error('exec stmt failed')
+          if (text === 'BEGIN' || text === 'COMMIT' || text === 'ROLLBACK' || text === 'START TRANSACTION') {
+            return [{}, []]
+          }
+          return [{ affectedRows: text.includes('two') ? 2 : 1 }, []]
+        },
+      }
+    },
+  }
+
+  // 字符串含分号：仍是单条语句，直接走 pool.query
+  assert.equal(await adapter.exec("INSERT INTO notes VALUES ('a; b')"), 1)
+  assert.deepEqual(poolCalls, ["INSERT INTO notes VALUES ('a; b')"])
+
+  // 带参数的单条语句
+  assert.equal(await adapter.exec('INSERT INTO notes VALUES (?)', undefined, { params: ['hello'], timeoutMs: 3000 }), 1)
+  assert.deepEqual(poolCalls[1], { sql: 'INSERT INTO notes VALUES (?)', values: ['hello'], timeout: 3000 })
+
+  // 带参数的多语句被拒绝
+  await assert.rejects(() => adapter.exec('INSERT INTO a VALUES (?); INSERT INTO b VALUES (?)', undefined, { params: [1, 2] }), /仅支持单条语句/)
+
+  // 空/纯注释脚本返回 0 且不发查询
+  const beforeEmpty = poolCalls.length
+  assert.equal(await adapter.exec('  -- only comment\n ; '), 0)
+  assert.equal(poolCalls.length, beforeEmpty)
+
+  // 多语句切分：在单连接上自动包 BEGIN / COMMIT 并累加 affectedRows
+  const total = await adapter.exec("INSERT INTO a VALUES ('one'); INSERT INTO b VALUES ('two')")
+  assert.equal(total, 3)
+  assert.deepEqual(connLog, ['BEGIN', "INSERT INTO a VALUES ('one')", "INSERT INTO b VALUES ('two')", 'COMMIT'])
+  assert.equal(released, true)
+  assert.equal(destroyed, false)
+
+  // 脚本自带事务关键字时不重复包 BEGIN / COMMIT
+  connLog.length = 0
+  const manual = await adapter.exec("START TRANSACTION; INSERT INTO a VALUES ('one'); COMMIT")
+  assert.equal(manual, 1)
+  assert.deepEqual(connLog, ['START TRANSACTION', "INSERT INTO a VALUES ('one')", 'COMMIT'])
+
+  // 多语句第 2 条失败时自动 ROLLBACK；即使 ROLLBACK 失败也不掩盖主错误并销毁连接
+  connLog.length = 0
+  failOnSql = 'boom'
+  failRollback = true
+  await assert.rejects(() => adapter.exec("INSERT INTO a VALUES ('one'); INSERT INTO b VALUES ('boom')"), /exec stmt failed/)
+  assert.deepEqual(connLog, ['BEGIN', "INSERT INTO a VALUES ('one')", "INSERT INTO b VALUES ('boom')", 'ROLLBACK'])
+  assert.equal(destroyed, true)
+  assert.equal(released, false)
+})
+
+test('PostgreSQL：exec 多语句累加数组 rowCount、支持 params 并拦截多语句 params', async () => {
+  const adapter = createAdapter({ name: 'pg', engine: 'postgres', database: 'app' })
+  const calls = []
+  adapter.pool = {
+    async query(sql, values) {
+      calls.push({ sql, values })
+      if (values !== undefined) return { rowCount: 1 }
+      if (sql.includes(';')) return [{ rowCount: 1 }, { rowCount: 2 }, { rowCount: null }]
+      return { rowCount: 4 }
+    },
+  }
+
+  assert.equal(await adapter.exec('INSERT INTO a VALUES (1); INSERT INTO a VALUES (2), (3); CREATE TEMP TABLE x(id INT)'), 3)
+  assert.equal(await adapter.exec('UPDATE a SET v = $1 WHERE id = $2', undefined, { params: ['ok', 7] }), 1)
+  assert.deepEqual(calls[1], { sql: 'UPDATE a SET v = $1 WHERE id = $2', values: ['ok', 7] })
+  await assert.rejects(() => adapter.exec('INSERT INTO a VALUES ($1); INSERT INTO a VALUES ($2)', undefined, { params: [1, 2] }), /仅支持单条语句/)
+  assert.equal(await adapter.exec('/* comment only */ ;'), 0)
+})
+
+test('MySQL / PostgreSQL：listTables 支持多 schema 与显式 schema 过滤', async () => {
+  const pgAdapter = createAdapter({ name: 'pg', engine: 'postgres', database: 'app' })
+  const pgCalls = []
+  pgAdapter.pool = {
+    async query(sql, values) {
+      pgCalls.push({ sql, values })
+      if (values !== undefined) {
+        return { rows: [{ table_schema: values[0], table_name: 'events' }] }
+      }
+      return {
+        rows: [
+          { table_schema: 'public', table_name: 'users' },
+          { table_schema: 'analytics', table_name: 'events' },
+        ],
+      }
+    },
+  }
+  assert.deepEqual(await pgAdapter.listTables(), ['users', 'analytics.events'])
+  assert.deepEqual(await pgAdapter.listTables(undefined, 'analytics'), ['analytics.events'])
+  assert.deepEqual(pgCalls[1].values, ['analytics'])
+
+  const myAdapter = createAdapter({ name: 'my', engine: 'mysql', database: 'app' })
+  const myCalls = []
+  myAdapter.pool = {
+    async query(sql) {
+      myCalls.push(sql)
+      return [[{ Tables_in_db: 'orders' }], []]
+    },
+  }
+  assert.deepEqual(await myAdapter.listTables(), ['orders'])
+  assert.deepEqual(await myAdapter.listTables(undefined, 'other-db'), ['orders'])
+  assert.deepEqual(myCalls, ['SHOW TABLES', 'SHOW TABLES FROM `other-db`'])
 })
 
 test('MySQL / PostgreSQL：readOnly 适配器直接调用 exec 也不会建立写连接', async () => {

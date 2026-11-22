@@ -8,7 +8,7 @@
  *
  * @module dsh-sql/host-config
  */
-import type { SqlConfig, SqlConnectionConfig } from './config.js'
+import type { SqlConfig, SqlConnectionConfig, SqlSslOption } from './config.js'
 
 const kSchema = Symbol.for('schemastery')
 const kValidationError = Symbol.for('ValidationError')
@@ -246,7 +246,7 @@ function resolveSchema(data: unknown, schema: HostSchemaNode | undefined, option
         return [data]
       }
       case 'number': {
-        if (typeof data !== 'number' || Number.isNaN(data)) throw new HostValidationError(`expected number but got ${String(data)}`, options)
+        if (typeof data !== 'number' || !Number.isFinite(data)) throw new HostValidationError(`expected number but got ${String(data)}`, options)
         checkRange(data, schema.meta, 'number', options)
         return [data]
       }
@@ -339,10 +339,12 @@ schemaProto.toJSON = function toJSON(this: HostSchemaNode): unknown {
     return this.uid
   }
   globalState.__schemastery_refs__ = { [this.uid]: { ...this } }
-  globalState.__schemastery_refs__[this.uid] = JSON.parse(JSON.stringify({ ...this }))
-  const result = { uid: this.uid, refs: globalState.__schemastery_refs__ }
-  globalState.__schemastery_refs__ = undefined
-  return result
+  try {
+    globalState.__schemastery_refs__[this.uid] = JSON.parse(JSON.stringify({ ...this }))
+    return { uid: this.uid, refs: globalState.__schemastery_refs__ }
+  } finally {
+    globalState.__schemastery_refs__ = undefined
+  }
 }
 
 schemaProto.toString = function toString(this: HostSchemaNode, inline = false): string {
@@ -499,27 +501,42 @@ const ConnectionSchema = z.object<SqlConnectionConfig>({
   name: z.string().required().description('连接名称（如 local / prod，用于多库切换与环境变量后缀）'),
   engine: z.union<'sqlite' | 'mysql' | 'postgres'>(['sqlite', 'mysql', 'postgres']).required()
     .description('数据库引擎：sqlite / mysql / postgres'),
+  url: z.string()
+    .description('可选连接 URI（postgres:// / postgresql:// / mysql:// / sqlite: / file:；显式字段优先；建议密码改用下方脱敏密码字段或环境变量）'),
   file: z.string().description('SQLite 数据库文件路径（或 :memory:）'),
   host: z.string().description('MySQL / PostgreSQL 主机地址（默认 localhost）'),
   port: z.number().min(1).max(65535).step(1).description('端口号（PostgreSQL 默认 5432，MySQL 默认 3306）'),
   user: z.string().description('数据库登录用户名'),
   password: z.string().role('secret')
     .description('数据库密码（自动脱敏；留空时自动读取环境变量 DSH_SQL_PASSWORD_<连接名大写>）'),
-  database: z.string().description('MySQL / PostgreSQL 目标库名（必填）'),
+  database: z.string().description('MySQL / PostgreSQL 目标库名（必填，或在 url 中提供）'),
+  readOnly: z.boolean()
+    .description('单连接只读锁（开启后仅该连接禁止 sql_exec 写操作并以只读方式连接）'),
+  ssl: z.union<SqlSslOption>([
+    'disable',
+    'require',
+    'verify-full',
+    z.boolean(),
+    z.object({
+      rejectUnauthorized: z.boolean().description('是否校验证书链与主机名'),
+      ca: z.string().description('自定义 CA 根证书（PEM 文本）'),
+    }),
+  ])
+    .description('TLS/SSL 连接配置（云数据库常用：disable / require / verify-full、布尔值或 { rejectUnauthorized, ca } 对象）'),
 })
 
 export const Config: HostSchemaNode<SqlConfig> = z.object<SqlConfig>({
   connections: z.array(ConnectionSchema).volatile()
     .description('数据库连接列表（保存即生效；未配置时默认提供临时 :memory: SQLite 连接）'),
-  maxRows: z.number().min(1).max(10000).step(100).volatile()
+  maxRows: z.number().min(1).max(10000).step(100).default(1000).volatile()
     .description('单次只读查询最多返回行数（1–10000，默认 1000）'),
-  readOnly: z.boolean().volatile()
+  readOnly: z.boolean().default(false).volatile()
     .description('全局只读开关（开启后禁用 sql_exec 并以只读方式连接数据库）'),
-  writeApproval: z.boolean().volatile()
+  writeApproval: z.boolean().default(true).volatile()
     .description('写操作审批门（默认开启；每次 sql_exec 前展示语句清单请求确认）'),
-  queryTimeoutMs: z.number().min(5000).max(600000).step(1000).volatile()
+  queryTimeoutMs: z.number().min(5000).max(600000).step(1000).default(60000).volatile()
     .description('单次只读查询超时毫秒数（默认 60000）'),
-  execTimeoutMs: z.number().min(5000).max(600000).step(1000).volatile()
+  execTimeoutMs: z.number().min(5000).max(600000).step(1000).default(120000).volatile()
     .description('单次写操作超时毫秒数（默认 120000）'),
 }).i18n({
   zh: {
@@ -528,12 +545,15 @@ export const Config: HostSchemaNode<SqlConfig> = z.object<SqlConfig>({
       $description: '数据库连接列表（未添加时使用内置 :memory: SQLite 临时连接）',
       name: '连接名称（如 local / prod）',
       engine: '数据库引擎（sqlite / mysql / postgres）',
+      url: '可选连接 URI（postgres:// / mysql:// / sqlite: / file:；建议密码通过下方脱敏字段或环境变量配置）',
       file: 'SQLite 文件路径（仅 sqlite 使用，如 E:\\data\\app.db 或 :memory:）',
       host: '数据库主机名或 IP（默认 localhost）',
       port: '端口号（PostgreSQL 默认 5432，MySQL 默认 3306）',
       user: '登录用户名',
       password: '登录密码（脱敏存储；留空则读取环境变量 DSH_SQL_PASSWORD_<连接名大写>）',
-      database: '目标数据库名（mysql / postgres 必填）',
+      database: '目标数据库名（mysql / postgres 必填，或在 url 中指定）',
+      readOnly: '单连接只读锁（开启后该连接禁止 sql_exec 写操作）',
+      ssl: 'TLS/SSL 模式（云数据库常用：disable / require / verify-full）',
     },
     maxRows: '单次查询返回行数上限（1–10000，默认 1000）',
     readOnly: '只读模式（开启后彻底禁用 sql_exec 写操作）',
@@ -547,12 +567,15 @@ export const Config: HostSchemaNode<SqlConfig> = z.object<SqlConfig>({
       $description: 'Database connections (uses an in-memory :memory: SQLite fallback when empty)',
       name: 'Connection name (e.g. local / prod)',
       engine: 'Database engine (sqlite / mysql / postgres)',
+      url: 'Optional connection URI (postgres:// / mysql:// / sqlite: / file:; prefer the secret password field or env var for credentials)',
       file: 'SQLite file path (for sqlite only, or :memory:)',
       host: 'Server hostname or IP (defaults to localhost)',
       port: 'Server port (5432 for PostgreSQL, 3306 for MySQL)',
       user: 'Database username',
       password: 'Database password (masked; falls back to env var DSH_SQL_PASSWORD_<NAME>)',
-      database: 'Database name (required for mysql / postgres)',
+      database: 'Database name (required for mysql / postgres, or via url)',
+      readOnly: 'Per-connection read-only lock (disables sql_exec writes on this connection)',
+      ssl: 'TLS/SSL mode for cloud databases (disable / require / verify-full)',
     },
     maxRows: 'Max rows returned per read query (1–10000, default 1000)',
     readOnly: 'Read-only mode (disables sql_exec writes completely)',

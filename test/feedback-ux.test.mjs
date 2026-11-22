@@ -1,22 +1,42 @@
-import { test } from 'node:test'
+import { after, test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync } from 'node:fs'
+import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { annotateError, buildSqlTools, connectionErrorHint, resolveConfig } from '../lib/index.js'
 
+const cleanups = []
+
 function makeTools() {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-sql-ux-'))
   const cfg = resolveConfig({ connections: [{ name: 'local', engine: 'sqlite', file: join(dir, 'ux.db') }], maxRows: 100 })
-  const { tools } = buildSqlTools(cfg, () => 'ask')
+  const { tools, adapters } = buildSqlTools(cfg, () => 'ask')
+  cleanups.push(async () => {
+    for (const adapter of adapters.values()) await adapter.close()
+    rmSync(dir, { recursive: true, force: true })
+  })
   return { tools, exec: tools.find((t) => t.name === 'sql_exec') }
 }
 
-test('connectionErrorHint：常见连接错误都给出下一步', () => {
+after(async () => {
+  while (cleanups.length > 0) {
+    const fn = cleanups.pop()
+    await fn()
+  }
+})
+
+test('connectionErrorHint：常见连接与 TLS/SSL、超时错误都给出下一步', () => {
   assert.match(connectionErrorHint('connect ECONNREFUSED 127.0.0.1:5432'), /服务已启动/)
-  assert.match(connectionErrorHint('Access denied for user \'root\'@\'localhost\''), /认证失败/)
-  assert.match(connectionErrorHint("SQLITE_CANTOPEN: unable to open database file"), /文件路径/)
-  assert.match(connectionErrorHint("relation \"users\" does not exist"), /sql_schema/)
+  assert.match(connectionErrorHint("Access denied for user 'root'@'localhost'"), /认证失败/)
+  assert.match(connectionErrorHint('SQLITE_CANTOPEN: unable to open database file'), /文件路径/)
+  assert.match(connectionErrorHint('relation "users" does not exist'), /sql_schema/)
+  assert.match(connectionErrorHint('The server does not support SSL connections'), /ssl/i)
+  assert.match(connectionErrorHint('self-signed certificate in certificate chain'), /ssl/i)
+  assert.match(connectionErrorHint('no pg_hba.conf entry for host "1.2.3.4", user "u", database "d", no encryption'), /ssl/i)
+  assert.match(connectionErrorHint('Connections using insecure transport are prohibited'), /ssl/i)
+  assert.match(connectionErrorHint('ERR_TLS_CERT_ALTNAME_INVALID'), /ssl/i)
+  assert.match(connectionErrorHint('The operation was aborted due to timeout'), /超时/)
+  assert.match(connectionErrorHint('canceling statement due to statement timeout'), /超时/)
   assert.equal(connectionErrorHint('Something unrelated broke'), undefined)
 })
 
@@ -56,13 +76,17 @@ test('sql_exec：0 行受影响时提示核对条件', async () => {
 
 test('sql_list / sql_health：坏连接渲染给出下一步', async () => {
   const cfg = resolveConfig({ connections: [{ name: 'bad', engine: 'mysql', host: '127.0.0.1', port: 1, database: 'x', user: 'u', password: 'p' }], maxRows: 10, queryTimeoutMs: 5000, execTimeoutMs: 5000 })
-  const { tools } = buildSqlTools(cfg)
-  const list = tools.find((t) => t.name === 'sql_list')
-  const listText = list.output.render({}, await list.execute({}))[0].text
-  assert.match(listText, /下一步：/)
-  assert.match(listText, /127\.0\.0\.1:1/)
-  const health = tools.find((t) => t.name === 'sql_health')
-  const healthText = health.output.render({}, await health.execute({}))[0].text
-  assert.match(healthText, /发现问题/)
-  assert.match(healthText, /下一步：/)
+  const { tools, adapters } = buildSqlTools(cfg)
+  try {
+    const list = tools.find((t) => t.name === 'sql_list')
+    const listText = list.output.render({}, await list.execute({}))[0].text
+    assert.match(listText, /下一步：/)
+    assert.match(listText, /127\.0\.0\.1:1/)
+    const health = tools.find((t) => t.name === 'sql_health')
+    const healthText = health.output.render({}, await health.execute({}))[0].text
+    assert.match(healthText, /发现问题/)
+    assert.match(healthText, /下一步：/)
+  } finally {
+    for (const adapter of adapters.values()) await adapter.close()
+  }
 })

@@ -1,13 +1,15 @@
 /**
  * 数据库适配器层：sqlite（node:sqlite 内置）/ mysql（mysql2）/ postgres（pg）三实现。
- * 统一接口：listTables / describeTable / query / exec / ping / close。
+ * 统一接口：listTables / describeTable / describeTableDetail / query / exec / ping / close。
  *
  * @module dsh-sql/adapters
  */
-import { DatabaseSync } from 'node:sqlite'
-import mysql from 'mysql2/promise'
-import pg from 'pg'
-import { assertIdentifier, type SqlConnectionConfig } from './config.js'
+import { existsSync, readFileSync } from 'node:fs'
+import { DatabaseSync, type SQLInputValue } from 'node:sqlite'
+import type mysql from 'mysql2/promise'
+import type pg from 'pg'
+import { parseTableRef, type SqlConnectionConfig, type SqlSslOption } from './config.js'
+import { splitSqlStatements, stripSqlNoise } from './sql-lexer.js'
 
 /** 查询结果：列名 + 行（值数组，无损 JSON 友好）。 */
 export interface QueryResult {
@@ -21,17 +23,103 @@ export interface ColumnInfo {
   type: string
   notNull: boolean
   primaryKey: boolean
+  defaultValue?: string | null
+  comment?: string | null
+}
+
+/** 索引元数据。 */
+export interface IndexInfo {
+  name: string
+  unique: boolean
+  columns: string[]
+}
+
+/** 外键元数据。 */
+export interface ForeignKeyInfo {
+  column: string
+  refTable: string
+  refColumn: string
+}
+
+/** 完整表结构详情（列、索引、外键、表注释）。 */
+export interface TableSchemaDetail {
+  table: string
+  schema?: string
+  comment?: string | null
+  columns: ColumnInfo[]
+  indexes: IndexInfo[]
+  foreignKeys: ForeignKeyInfo[]
+}
+
+/** 查询附加选项（参数绑定与服务端超时）。 */
+export interface QueryOptions {
+  params?: unknown[]
+  timeoutMs?: number
+}
+
+/** 写执行附加选项（参数绑定与超时）。 */
+export interface ExecOptions {
+  params?: unknown[]
+  timeoutMs?: number
 }
 
 /** 统一适配器接口。 */
 export interface DatabaseAdapter {
   engine: 'sqlite' | 'mysql' | 'postgres'
-  listTables(signal?: AbortSignal): Promise<string[]>
+  listTables(signal?: AbortSignal, schema?: string): Promise<string[]>
   describeTable(table: string, signal?: AbortSignal): Promise<ColumnInfo[]>
-  query(sql: string, limit?: number, signal?: AbortSignal): Promise<QueryResult>
-  exec(sql: string, signal?: AbortSignal): Promise<number>
+  describeTableDetail?(table: string, signal?: AbortSignal): Promise<TableSchemaDetail>
+  query(sql: string, limit?: number, signal?: AbortSignal, options?: QueryOptions): Promise<QueryResult>
+  exec(sql: string, signal?: AbortSignal, options?: ExecOptions): Promise<number>
   ping(signal?: AbortSignal): Promise<void>
   close(): Promise<void>
+}
+
+/** 适配器额外选项：readOnly 时把只读约束下沉到数据库自身。 */
+export interface AdapterOptions {
+  readOnly?: boolean
+}
+
+const INLINE_BLOB_MAX_BYTES = 64
+const BLOB_PREVIEW_BYTES = 16
+const SQLITE_TX_OR_PRAGMA = /\b(?:begin|commit|end\s+transaction|rollback|savepoint|pragma|vacuum)\b/i
+const MYSQL_TX_CONTROL = /\b(?:begin|start\s+transaction|commit|rollback|savepoint|release\s+savepoint|lock\s+tables|unlock\s+tables|set\s+(?:session\s+|local\s+)?autocommit)\b/i
+
+let mysqlModule: typeof mysql | undefined
+let mysqlModulePromise: Promise<typeof mysql> | undefined
+let pgModule: typeof pg | undefined
+let pgModulePromise: Promise<typeof pg> | undefined
+
+async function loadMysql(): Promise<typeof mysql> {
+  if (mysqlModule !== undefined) return mysqlModule
+  if (mysqlModulePromise === undefined) {
+    mysqlModulePromise = import('mysql2/promise')
+      .then((mod) => {
+        mysqlModule = (mod.default ?? mod) as typeof mysql
+        return mysqlModule
+      })
+      .catch((error) => {
+        mysqlModulePromise = undefined
+        throw error
+      })
+  }
+  return await mysqlModulePromise
+}
+
+async function loadPg(): Promise<typeof pg> {
+  if (pgModule !== undefined) return pgModule
+  if (pgModulePromise === undefined) {
+    pgModulePromise = import('pg')
+      .then((mod) => {
+        pgModule = (mod.default ?? mod) as typeof pg
+        return pgModule
+      })
+      .catch((error) => {
+        pgModulePromise = undefined
+        throw error
+      })
+  }
+  return await pgModulePromise
 }
 
 function abortReason(signal: AbortSignal): unknown {
@@ -63,6 +151,12 @@ function acquireWithSignal<T>(acquire: () => Promise<T>, release: (resource: T) 
   })
 }
 
+function validTimeoutMs(timeoutMs?: number): number | undefined {
+  if (typeof timeoutMs !== 'number' || !Number.isFinite(timeoutMs)) return undefined
+  const rounded = Math.round(timeoutMs)
+  return rounded > 0 ? rounded : undefined
+}
+
 function toValue(value: unknown): unknown {
   if (typeof value === 'bigint') {
     if (value >= BigInt(Number.MIN_SAFE_INTEGER) && value <= BigInt(Number.MAX_SAFE_INTEGER)) {
@@ -71,7 +165,14 @@ function toValue(value: unknown): unknown {
     return value.toString()
   }
   if (value instanceof Date) return value.toISOString()
-  if (value instanceof Uint8Array) return Array.from(value)
+  if (value instanceof Uint8Array) {
+    if (value.byteLength <= INLINE_BLOB_MAX_BYTES) {
+      return '0x' + Buffer.from(value.buffer, value.byteOffset, value.byteLength).toString('hex')
+    }
+    const previewLen = Math.min(BLOB_PREVIEW_BYTES, value.byteLength)
+    const hexPrefix = Buffer.from(value.buffer, value.byteOffset, previewLen).toString('hex')
+    return '<BLOB ' + value.byteLength + ' bytes, hex: 0x' + hexPrefix + '...>'
+  }
   if (value instanceof Map) return Object.fromEntries(value)
   return value
 }
@@ -86,12 +187,70 @@ function quoteSqliteIdentifier(name: string): string {
   return '"' + name.replace(/"/g, '""') + '"'
 }
 
-function streamMysqlQuery(corePool: { query(querySql: mysql.QueryOptions): any }, sql: string, limit: number, discard: () => void): Promise<QueryResult> {
+function quoteMysqlIdentifier(name: string): string {
+  return '`' + name.replace(/`/g, '``') + '`'
+}
+
+function parseOptionalSchema(schema?: string): string | undefined {
+  if (schema === undefined) return undefined
+  const trimmed = schema.trim()
+  if (trimmed === '') return undefined
+  const ref = parseTableRef(trimmed, 'schema')
+  if (ref.schema !== undefined) {
+    throw new Error('schema 非法（不能包含多段路径）：' + schema)
+  }
+  return ref.table
+}
+
+function bindSqliteParams(params: unknown[]): SQLInputValue[] {
+  return params.map((value) => {
+    if (value === undefined) return null
+    if (typeof value === 'boolean') return value ? 1 : 0
+    return value as SQLInputValue
+  })
+}
+
+function hasSqliteTxOrPragma(sql: string): boolean {
+  return SQLITE_TX_OR_PRAGMA.test(stripSqlNoise(sql, 'sqlite'))
+}
+
+function hasMysqlTxControl(sql: string): boolean {
+  return MYSQL_TX_CONTROL.test(stripSqlNoise(sql, 'mysql'))
+}
+
+function resolveCaValue(ca: string): string {
+  const trimmed = ca.trim()
+  if (trimmed.includes('-----BEGIN')) return ca
+  if (existsSync(trimmed)) return readFileSync(trimmed, 'utf8')
+  return ca
+}
+
+function resolveSslConfig(ssl?: SqlSslOption): { rejectUnauthorized?: boolean; ca?: string } | undefined {
+  if (ssl === undefined || ssl === false || ssl === 'disable') return undefined
+  if (ssl === true || ssl === 'require') return { rejectUnauthorized: false }
+  if (ssl === 'verify-full') return { rejectUnauthorized: true }
+  const out: { rejectUnauthorized?: boolean; ca?: string } = {}
+  if (ssl.rejectUnauthorized !== undefined) out.rejectUnauthorized = ssl.rejectUnauthorized
+  if (ssl.ca !== undefined) out.ca = resolveCaValue(ssl.ca)
+  return out
+}
+
+function streamMysqlQuery(
+  corePool: { query(querySql: mysql.QueryOptions): any },
+  sql: string,
+  limit: number,
+  discard: () => void,
+  params?: unknown[],
+  timeout?: number,
+): Promise<QueryResult> {
   return new Promise<QueryResult>((resolve, reject) => {
     let settled = false
     let columns: string[] = []
     const rows: unknown[][] = []
-    const stream = corePool.query({ sql, rowsAsArray: true }).stream({ highWaterMark: 64 })
+    const queryOpts: mysql.QueryOptions = { sql, rowsAsArray: true }
+    if (params !== undefined && params.length > 0) queryOpts.values = params as mysql.QueryValues
+    if (timeout !== undefined) queryOpts.timeout = timeout
+    const stream = corePool.query(queryOpts).stream({ highWaterMark: 64 })
     const finish = (): void => {
       if (settled) return
       settled = true
@@ -123,14 +282,28 @@ function streamMysqlQuery(corePool: { query(querySql: mysql.QueryOptions): any }
 }
 
 /** pg's `rows` option is a page size; row events avoid its full result accumulator. */
-function streamPostgresQuery(client: pg.PoolClient, sql: string, limit: number, discard: () => void): Promise<QueryResult> {
-  return new Promise<QueryResult>((resolve, reject) => {
+async function streamPostgresQuery(
+  client: pg.PoolClient,
+  sql: string,
+  limit: number,
+  discard: () => void,
+  isDiscarded: () => boolean,
+  params?: unknown[],
+): Promise<QueryResult> {
+  const pgMod = pgModule ?? await loadPg()
+  if (isDiscarded()) return { columns: [], rows: [] }
+  return await new Promise<QueryResult>((resolve, reject) => {
     let settled = false
     let columns: string[] = []
     const rows: unknown[][] = []
     // The extended protocol rejects multiple commands in a single Parse message.
-    const queryConfig: pg.QueryArrayConfig & { queryMode: 'extended' } = { text: sql, rowMode: 'array', queryMode: 'extended' }
-    const query = new pg.Query(queryConfig)
+    const queryConfig: pg.QueryArrayConfig & { queryMode: 'extended' } = {
+      text: sql,
+      rowMode: 'array',
+      queryMode: 'extended',
+    }
+    if (params !== undefined && params.length > 0) queryConfig.values = params
+    const query = new pgMod.Query(queryConfig)
     query.on('row', (row, result) => {
       if (settled) return
       if (columns.length === 0) columns = result?.fields.map((field) => field.name) ?? Object.keys(row)
@@ -159,26 +332,25 @@ function streamPostgresQuery(client: pg.PoolClient, sql: string, limit: number, 
   })
 }
 
-/** 适配器额外选项：readOnly 时把只读约束下沉到数据库自身。 */
-export interface AdapterOptions {
-  readOnly?: boolean
-}
-
 /** MySQL 连接池配置（导出以便测试断言，不含连接）。 */
 export function mysqlPoolConfig(connection: SqlConnectionConfig): mysql.PoolOptions {
-  return {
+  const ssl = resolveSslConfig(connection.ssl)
+  const config: mysql.PoolOptions = {
     host: connection.host ?? 'localhost',
     port: connection.port ?? 3306,
     user: connection.user ?? '',
     password: connection.password ?? '',
     database: connection.database ?? '',
     connectionLimit: 5,
+    connectTimeout: 10000,
     enableKeepAlive: true,
     supportBigNumbers: true,
     bigNumberStrings: true,
     // 显式关掉多语句：即使词法校验被绕过，服务器也不会把第二句当命令执行。
     multipleStatements: false,
   }
+  if (ssl !== undefined) config.ssl = ssl
+  return config
 }
 
 /**
@@ -186,6 +358,7 @@ export function mysqlPoolConfig(connection: SqlConnectionConfig): mysql.PoolOpti
  * 独立只读事务，不能依赖可被 set_config 修改的会话默认设置。
  */
 export function postgresPoolConfig(connection: SqlConnectionConfig, readOnly = false): pg.PoolConfig {
+  const ssl = resolveSslConfig(connection.ssl)
   const config: pg.PoolConfig = {
     host: connection.host ?? 'localhost',
     port: connection.port ?? 5432,
@@ -193,8 +366,10 @@ export function postgresPoolConfig(connection: SqlConnectionConfig, readOnly = f
     password: connection.password ?? '',
     database: connection.database ?? '',
     max: 5,
+    connectionTimeoutMillis: 10000,
   }
   if (readOnly) config.options = '-c default_transaction_read_only=on'
+  if (ssl !== undefined) config.ssl = ssl
   return config
 }
 
@@ -202,10 +377,12 @@ export function postgresPoolConfig(connection: SqlConnectionConfig, readOnly = f
 class SqliteAdapter implements DatabaseAdapter {
   engine = 'sqlite' as const
   private db: DatabaseSync
+  private readOnly: boolean
   constructor(file: string, readOnly = false) {
+    this.readOnly = readOnly
     const memory = file === ':memory:'
-    // 内存库没有落盘风险，也不支持只读打开；文件库在 readOnly 下由 SQLite
-    // 自己拒绝任何写入（PRAGMA 写、DDL、DML 都会报 attempt to write a readonly database）。
+    // 文件库在 readOnly 下以操作系统级只读打开；内存库与文件库均启用 PRAGMA query_only = ON
+    // 与防御模式（enableDefensive），确保 SQLite 引擎自身拒绝所有写入。
     const options = readOnly && !memory ? { readOnly: true } : {}
     try {
       this.db = new DatabaseSync(memory ? ':memory:' : file, options)
@@ -214,55 +391,144 @@ class SqliteAdapter implements DatabaseAdapter {
       throw new Error('无法打开 SQLite 文件 ' + file + '（readOnly=' + readOnly + '）：' + detail)
     }
     this.db.exec('PRAGMA busy_timeout = 5000')
+    ;(this.db as { enableDefensive?(on: boolean): void }).enableDefensive?.(true)
+    if (readOnly) this.db.exec('PRAGMA query_only = ON')
   }
-  async listTables(signal?: AbortSignal) {
+  async listTables(signal?: AbortSignal, schema?: string) {
     signal?.throwIfAborted()
-    const result = this.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all() as Array<Record<string, unknown>>
+    const parsedSchema = parseOptionalSchema(schema)
+    const master = parsedSchema !== undefined ? quoteSqliteIdentifier(parsedSchema) + '.sqlite_master' : 'sqlite_master'
+    const result = this.db.prepare("SELECT name FROM " + master + " WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all() as Array<Record<string, unknown>>
     signal?.throwIfAborted()
     return result.map((row) => String(row.name))
   }
   async describeTable(table: string, signal?: AbortSignal) {
     signal?.throwIfAborted()
-    const name = assertIdentifier(table, '表名')
-    const rows = this.db.prepare('PRAGMA table_info(' + quoteSqliteIdentifier(name) + ')').all() as Array<Record<string, unknown>>
+    const ref = parseTableRef(table, '表名')
+    const schemaPrefix = ref.schema !== undefined ? quoteSqliteIdentifier(ref.schema) + '.' : ''
+    const rows = this.db.prepare('PRAGMA ' + schemaPrefix + 'table_info(' + quoteSqliteIdentifier(ref.table) + ')').all() as Array<Record<string, unknown>>
     signal?.throwIfAborted()
     return rows.map((row) => ({
       name: String(row.name),
       type: String(row.type ?? ''),
       notNull: Number(row.notnull) === 1,
       primaryKey: Number(row.pk) > 0,
+      defaultValue: row.dflt_value === null || row.dflt_value === undefined ? null : String(row.dflt_value),
     }))
   }
-  async query(sql: string, limit?: number, signal?: AbortSignal) {
+  async describeTableDetail(table: string, signal?: AbortSignal): Promise<TableSchemaDetail> {
     signal?.throwIfAborted()
-    const statement = this.db.prepare(sql)
-    statement.setReadBigInts(true)
-    statement.setReturnArrays(true)
-    const columns = statement.columns().map((column) => column.name)
-    if (limit === undefined || limit <= 0) {
-      const rows = (statement.all() as unknown as unknown[][]).map(row => row.map(toValue))
+    const ref = parseTableRef(table, '表名')
+    const schemaPrefix = ref.schema !== undefined ? quoteSqliteIdentifier(ref.schema) + '.' : ''
+    const columns = await this.describeTable(table, signal)
+    const indexRows = this.db.prepare('PRAGMA ' + schemaPrefix + 'index_list(' + quoteSqliteIdentifier(ref.table) + ')').all() as Array<Record<string, unknown>>
+    const indexes: IndexInfo[] = []
+    for (const idxRow of indexRows) {
       signal?.throwIfAborted()
-      return { columns, rows }
+      const indexName = String(idxRow.name ?? '')
+      const infoRows = this.db.prepare('PRAGMA ' + schemaPrefix + 'index_info(' + quoteSqliteIdentifier(indexName) + ')').all() as Array<Record<string, unknown>>
+      const indexCols = infoRows
+        .sort((a, b) => Number(a.seqno ?? 0) - Number(b.seqno ?? 0))
+        .map((r) => r.name === null || r.name === undefined ? '<expr>' : String(r.name))
+      indexes.push({
+        name: indexName,
+        unique: Number(idxRow.unique) === 1,
+        columns: indexCols,
+      })
     }
-    const rows: unknown[][] = []
-    for (const raw of statement.iterate()) {
-      rows.push((raw as unknown as unknown[]).map(toValue))
-      signal?.throwIfAborted()
-      if (rows.length >= limit) break
+    const fkRows = this.db.prepare('PRAGMA ' + schemaPrefix + 'foreign_key_list(' + quoteSqliteIdentifier(ref.table) + ')').all() as Array<Record<string, unknown>>
+    const foreignKeys: ForeignKeyInfo[] = fkRows.map((row) => ({
+      column: String(row.from ?? ''),
+      refTable: String(row.table ?? ''),
+      refColumn: row.to === null || row.to === undefined ? '' : String(row.to),
+    }))
+    signal?.throwIfAborted()
+    return {
+      table: ref.table,
+      ...(ref.schema !== undefined ? { schema: ref.schema } : {}),
+      comment: null,
+      columns,
+      indexes,
+      foreignKeys,
     }
-    return { columns, rows }
   }
-  async exec(sql: string, signal?: AbortSignal) {
+  async query(sql: string, limit?: number, signal?: AbortSignal, options?: QueryOptions) {
     signal?.throwIfAborted()
-    const single = sql.replace(/;\s*$/, '').trim()
-    if (single.includes(';')) {
-      this.db.exec(sql)
-      signal?.throwIfAborted()
-      return 0
+    if (!this.readOnly) this.db.exec('PRAGMA query_only = ON')
+    let hasPrimaryError = false
+    try {
+      const statement = this.db.prepare(sql)
+      statement.setReadBigInts(true)
+      statement.setReturnArrays(true)
+      const columns = statement.columns().map((column) => column.name)
+      const bound = options?.params !== undefined && options.params.length > 0
+        ? bindSqliteParams(options.params)
+        : undefined
+      if (limit === undefined || limit <= 0) {
+        const rawRows = bound !== undefined ? statement.all(...bound) : statement.all()
+        const rows = (rawRows as unknown as unknown[][]).map((row) => row.map(toValue))
+        signal?.throwIfAborted()
+        return { columns, rows }
+      }
+      const rows: unknown[][] = []
+      const iterator = bound !== undefined ? statement.iterate(...bound) : statement.iterate()
+      for (const raw of iterator) {
+        rows.push((raw as unknown as unknown[]).map(toValue))
+        signal?.throwIfAborted()
+        if (rows.length >= limit) break
+      }
+      return { columns, rows }
+    } catch (error) {
+      hasPrimaryError = true
+      throw error
+    } finally {
+      if (!this.readOnly) {
+        try {
+          this.db.exec('PRAGMA query_only = OFF')
+        } catch (cleanupError) {
+          if (!hasPrimaryError) throw cleanupError
+        }
+      }
     }
-    const result = this.db.prepare(single).run()
+  }
+  private totalChanges(): number {
+    return Number((this.db.prepare('SELECT total_changes() AS tc').get() as { tc: number | bigint }).tc)
+  }
+  async exec(sql: string, signal?: AbortSignal, options?: ExecOptions) {
+    if (this.readOnly) throw new Error('当前配置 readOnly=true，禁止写入数据库。')
     signal?.throwIfAborted()
-    return Number(result.changes)
+    const stmts = splitSqlStatements(sql, 'sqlite')
+    if (stmts.length === 0) return 0
+    const params = options?.params
+    if (params !== undefined && params.length > 0) {
+      if (stmts.length > 1) {
+        throw new Error('带参数（params）的 sql_exec 仅支持单条语句。')
+      }
+      const before = this.totalChanges()
+      this.db.prepare(stmts[0]).run(...bindSqliteParams(params))
+      signal?.throwIfAborted()
+      return this.totalChanges() - before
+    }
+    if (stmts.length === 1) {
+      const before = this.totalChanges()
+      this.db.prepare(stmts[0]).run()
+      signal?.throwIfAborted()
+      return this.totalChanges() - before
+    }
+    const before = this.totalChanges()
+    const wrapTx = !hasSqliteTxOrPragma(sql) && (this.db as { isTransaction?: boolean }).isTransaction !== true
+    if (wrapTx) this.db.exec('BEGIN')
+    try {
+      this.db.exec(sql)
+      if (wrapTx) this.db.exec('COMMIT')
+    } catch (error) {
+      if (wrapTx) {
+        try { this.db.exec('ROLLBACK') } catch {}
+      }
+      throw error
+    }
+    signal?.throwIfAborted()
+    return this.totalChanges() - before
   }
   async ping(signal?: AbortSignal) {
     signal?.throwIfAborted()
@@ -274,16 +540,31 @@ class SqliteAdapter implements DatabaseAdapter {
   }
 }
 
-/** MySQL 适配器（mysql2 连接池）。 */
+/** MySQL 适配器（mysql2 连接池，按需动态导入驱动）。 */
 class MysqlAdapter implements DatabaseAdapter {
   engine = 'mysql' as const
-  private pool: mysql.Pool
-  constructor(connection: SqlConnectionConfig, private readOnly = false) {
-    this.pool = mysql.createPool(mysqlPoolConfig(connection))
+  private pool: mysql.Pool | undefined
+  private poolPromise: Promise<mysql.Pool> | undefined
+  constructor(private connection: SqlConnectionConfig, private readOnly = false) {}
+  private async getPool(): Promise<mysql.Pool> {
+    if (this.pool !== undefined) return this.pool
+    if (this.poolPromise === undefined) {
+      this.poolPromise = loadMysql().then((mysqlMod) => {
+        if (this.pool !== undefined) return this.pool
+        const pool = mysqlMod.createPool(mysqlPoolConfig(this.connection))
+        this.pool = pool
+        return pool
+      }).catch((error) => {
+        this.poolPromise = undefined
+        throw error
+      })
+    }
+    return await this.poolPromise
   }
   private async withSignalConnection<T>(signal: AbortSignal | undefined, work: (connection: mysql.PoolConnection, discard: () => void, isDiscarded: () => boolean) => Promise<T>): Promise<T> {
     signal?.throwIfAborted()
-    const connection = await acquireWithSignal(() => this.pool.getConnection(), connection => connection.release(), signal)
+    const pool = this.pool ?? await this.getPool()
+    const connection = await acquireWithSignal(() => pool.getConnection(), connection => connection.release(), signal)
     let destroyed = false
     let rejectAbort: (reason: unknown) => void = () => {}
     const aborted = new Promise<never>((_resolve, reject) => { rejectAbort = reject })
@@ -305,71 +586,239 @@ class MysqlAdapter implements DatabaseAdapter {
       if (!destroyed) connection.release()
     }
   }
-  private async withReadOnlyConnection<T>(signal: AbortSignal | undefined, work: (connection: mysql.PoolConnection, discard: () => void) => Promise<T>): Promise<T> {
+  private async withReadOnlyConnection<T>(signal: AbortSignal | undefined, work: (connection: mysql.PoolConnection, discard: () => void, isDiscarded: () => boolean) => Promise<T>): Promise<T> {
     return await this.withSignalConnection(signal, async (connection, discard, isDiscarded) => {
+      let inTransaction = false
+      let hasPrimaryError = false
       try {
         // Await setup and fail closed; never silently ignore an unsupported mode.
-        await connection.query('START TRANSACTION READ ONLY')
-        return await work(connection, discard)
+        try {
+          await connection.query('START TRANSACTION READ ONLY')
+          inTransaction = true
+        } catch (error) {
+          discard()
+          throw error
+        }
+        return await work(connection, discard, isDiscarded)
+      } catch (error) {
+        hasPrimaryError = true
+        throw error
       } finally {
-        if (!isDiscarded()) {
-          try { await connection.query('ROLLBACK') } catch (error) { discard(); throw error }
+        if (inTransaction && !isDiscarded()) {
+          try {
+            await connection.query('ROLLBACK')
+          } catch (rollbackError) {
+            discard()
+            if (!hasPrimaryError) throw rollbackError
+          }
         }
       }
     })
   }
   private async queryRows(sql: string | mysql.QueryOptions, signal?: AbortSignal): Promise<any> {
-    if (signal === undefined) return typeof sql === 'string' ? await this.pool.query(sql) : await this.pool.query(sql)
+    if (signal === undefined) {
+      const pool = this.pool ?? await this.getPool()
+      return typeof sql === 'string' ? await pool.query(sql) : await pool.query(sql)
+    }
     return await this.withSignalConnection(signal, async (connection) => typeof sql === 'string' ? await connection.query(sql) : await connection.query(sql))
   }
-  async listTables(signal?: AbortSignal) {
-    const [rows] = await this.queryRows('SHOW TABLES', signal) as unknown as [Array<Record<string, unknown>>, unknown]
+  async listTables(signal?: AbortSignal, schema?: string) {
+    const parsedSchema = parseOptionalSchema(schema)
+    const sql = parsedSchema !== undefined ? 'SHOW TABLES FROM ' + quoteMysqlIdentifier(parsedSchema) : 'SHOW TABLES'
+    const [rows] = await this.queryRows(sql, signal) as unknown as [Array<Record<string, unknown>>, unknown]
     return rows.map((row) => String(Object.values(row)[0] ?? ''))
   }
   async describeTable(table: string, signal?: AbortSignal) {
-    const name = assertIdentifier(table, '表名')
-    const [rows] = await this.queryRows('DESCRIBE `' + name + '`', signal) as unknown as [Array<Record<string, unknown>>, unknown]
+    const ref = parseTableRef(table, '表名')
+    const qualified = (ref.schema !== undefined ? quoteMysqlIdentifier(ref.schema) + '.' : '') + quoteMysqlIdentifier(ref.table)
+    const [rows] = await this.queryRows('SHOW FULL COLUMNS FROM ' + qualified, signal) as unknown as [Array<Record<string, unknown>>, unknown]
     return rows.map((row) => ({
       name: String(row.Field),
       type: String(row.Type ?? ''),
       notNull: String(row.Null ?? '').toUpperCase() === 'NO',
       primaryKey: String(row.Key ?? '').toUpperCase() === 'PRI',
+      defaultValue: row.Default === null || row.Default === undefined ? null : String(row.Default),
+      comment: typeof row.Comment === 'string' && row.Comment !== '' ? row.Comment : null,
     }))
   }
-  async query(sql: string, limit?: number, signal?: AbortSignal) {
+  async describeTableDetail(table: string, signal?: AbortSignal): Promise<TableSchemaDetail> {
+    const ref = parseTableRef(table, '表名')
+    const qualified = (ref.schema !== undefined ? quoteMysqlIdentifier(ref.schema) + '.' : '') + quoteMysqlIdentifier(ref.table)
+    const columns = await this.describeTable(table, signal)
+    const [indexRows] = await this.queryRows('SHOW INDEX FROM ' + qualified, signal) as unknown as [Array<Record<string, unknown>>, unknown]
+    const indexMap = new Map<string, { unique: boolean; cols: Array<{ seq: number; col: string }> }>()
+    for (const row of indexRows) {
+      const keyName = String(row.Key_name ?? '')
+      if (keyName === '') continue
+      const entry = indexMap.get(keyName) ?? { unique: Number(row.Non_unique) === 0, cols: [] }
+      const colName = row.Column_name !== null && row.Column_name !== undefined
+        ? String(row.Column_name)
+        : (row.Expression !== null && row.Expression !== undefined ? String(row.Expression) : '<expr>')
+      entry.cols.push({ seq: Number(row.Seq_in_index ?? 0), col: colName })
+      indexMap.set(keyName, entry)
+    }
+    const indexes: IndexInfo[] = [...indexMap.entries()].map(([name, info]) => ({
+      name,
+      unique: info.unique,
+      columns: info.cols.sort((a, b) => a.seq - b.seq).map((item) => item.col),
+    }))
+    const schemaFilterSql = ref.schema !== undefined ? 'TABLE_SCHEMA = ?' : 'TABLE_SCHEMA = DATABASE()'
+    const metaParams = ref.schema !== undefined ? [ref.schema, ref.table] : [ref.table]
+    const [fkRows] = await this.queryRows(
+      {
+        sql: `SELECT COLUMN_NAME, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME
+                FROM information_schema.KEY_COLUMN_USAGE
+               WHERE ${schemaFilterSql}
+                 AND TABLE_NAME = ?
+                 AND REFERENCED_TABLE_NAME IS NOT NULL
+               ORDER BY CONSTRAINT_NAME, ORDINAL_POSITION`,
+        values: metaParams,
+      },
+      signal,
+    ) as unknown as [Array<Record<string, unknown>>, unknown]
+    const foreignKeys: ForeignKeyInfo[] = fkRows.map((row) => ({
+      column: String(row.COLUMN_NAME ?? ''),
+      refTable: String(row.REFERENCED_TABLE_NAME ?? ''),
+      refColumn: String(row.REFERENCED_COLUMN_NAME ?? ''),
+    }))
+    const [tableRows] = await this.queryRows(
+      {
+        sql: `SELECT TABLE_COMMENT FROM information_schema.TABLES WHERE ${schemaFilterSql} AND TABLE_NAME = ? LIMIT 1`,
+        values: metaParams,
+      },
+      signal,
+    ) as unknown as [Array<Record<string, unknown>>, unknown]
+    const rawComment = tableRows?.[0]?.TABLE_COMMENT
+    const comment = typeof rawComment === 'string' && rawComment !== '' ? rawComment : null
+    return {
+      table: ref.table,
+      ...(ref.schema !== undefined ? { schema: ref.schema } : {}),
+      comment,
+      columns,
+      indexes,
+      foreignKeys,
+    }
+  }
+  async query(sql: string, limit?: number, signal?: AbortSignal, options?: QueryOptions) {
+    const params = options?.params
+    const timeout = validTimeoutMs(options?.timeoutMs)
     return await this.withReadOnlyConnection(signal, async (connection, discard) => {
       if (limit === undefined || limit <= 0) {
-        const [rows, fields] = await connection.query({ sql, rowsAsArray: true }) as [any[], any[]]
+        const queryOpts: mysql.QueryOptions = { sql, rowsAsArray: true }
+        if (params !== undefined && params.length > 0) queryOpts.values = params as mysql.QueryValues
+        if (timeout !== undefined) queryOpts.timeout = timeout
+        const [rows, fields] = await connection.query(queryOpts) as [any[], any[]]
         if (fields?.length) return { columns: fields.map(field => field.name as string), rows: rows.map(row => Array.isArray(row) ? row.map(toValue) : fields.map(field => toValue(row[field.name]))) }
         return rowsToColumns(rows)
       }
       const coreConnection = (connection as unknown as { connection: { query(querySql: mysql.QueryOptions): any } }).connection
-      return await streamMysqlQuery(coreConnection, sql, limit, discard)
+      return await streamMysqlQuery(coreConnection, sql, limit, discard, params, timeout)
     })
   }
-  async exec(sql: string, signal?: AbortSignal) {
+  async exec(sql: string, signal?: AbortSignal, options?: ExecOptions) {
     if (this.readOnly) throw new Error('当前配置 readOnly=true，禁止写入数据库。')
-    const [result] = await this.queryRows(sql, signal) as unknown as [{ affectedRows?: number }, unknown]
-    return Number(result?.affectedRows ?? 0)
+    signal?.throwIfAborted()
+    const stmts = splitSqlStatements(sql, 'mysql')
+    if (stmts.length === 0) return 0
+    const params = options?.params
+    const timeout = validTimeoutMs(options?.timeoutMs)
+    if (params !== undefined && params.length > 0) {
+      if (stmts.length > 1) {
+        throw new Error('带参数（params）的 sql_exec 仅支持单条语句。')
+      }
+      const queryOpts: mysql.QueryOptions = { sql: stmts[0], values: params as mysql.QueryValues }
+      if (timeout !== undefined) queryOpts.timeout = timeout
+      const [result] = await this.queryRows(queryOpts, signal) as unknown as [{ affectedRows?: number }, unknown]
+      return Number(result?.affectedRows ?? 0)
+    }
+    if (stmts.length === 1) {
+      const queryArg: string | mysql.QueryOptions = timeout !== undefined ? { sql: stmts[0], timeout } : stmts[0]
+      const [result] = await this.queryRows(queryArg, signal) as unknown as [{ affectedRows?: number }, unknown]
+      return Number(result?.affectedRows ?? 0)
+    }
+    const wrapTx = !hasMysqlTxControl(sql)
+    return await this.withSignalConnection(signal, async (connection, discard, isDiscarded) => {
+      let inTransaction = false
+      let hasPrimaryError = false
+      let total = 0
+      try {
+        if (wrapTx) {
+          try {
+            await connection.query('BEGIN')
+            inTransaction = true
+          } catch (error) {
+            discard()
+            throw error
+          }
+        }
+        for (const stmt of stmts) {
+          signal?.throwIfAborted()
+          const queryArg: string | mysql.QueryOptions = timeout !== undefined ? { sql: stmt, timeout } : stmt
+          const [res] = (typeof queryArg === 'string'
+            ? await connection.query(queryArg)
+            : await connection.query(queryArg)) as unknown as [{ affectedRows?: number }, unknown]
+          total += Number(res?.affectedRows ?? 0)
+        }
+        if (wrapTx) {
+          await connection.query('COMMIT')
+          inTransaction = false
+        }
+        return total
+      } catch (error) {
+        hasPrimaryError = true
+        if (!wrapTx) discard()
+        throw error
+      } finally {
+        if (inTransaction && !isDiscarded()) {
+          try {
+            await connection.query('ROLLBACK')
+          } catch (rollbackError) {
+            discard()
+            if (!hasPrimaryError) throw rollbackError
+          }
+        }
+      }
+    })
   }
   async ping(signal?: AbortSignal) {
     await this.queryRows('SELECT 1', signal)
   }
   async close() {
-    await this.pool.end()
+    const pending = this.poolPromise
+    this.poolPromise = undefined
+    const pool = this.pool ?? (pending ? await pending.catch(() => undefined) : undefined)
+    this.pool = undefined
+    if (pool !== undefined) await pool.end()
   }
 }
 
-/** PostgreSQL 适配器（pg 连接池）。 */
+/** PostgreSQL 适配器（pg 连接池，按需动态导入驱动）。 */
 class PostgresAdapter implements DatabaseAdapter {
   engine = 'postgres' as const
-  private pool: pg.Pool
-  constructor(connection: SqlConnectionConfig, private readOnly = false) {
-    this.pool = new pg.Pool(postgresPoolConfig(connection, readOnly))
+  private pool: pg.Pool | undefined
+  private poolPromise: Promise<pg.Pool> | undefined
+  constructor(private connection: SqlConnectionConfig, private readOnly = false) {}
+  private async getPool(): Promise<pg.Pool> {
+    if (this.pool !== undefined) return this.pool
+    if (this.poolPromise === undefined) {
+      this.poolPromise = loadPg().then((pgMod) => {
+        if (this.pool !== undefined) return this.pool
+        const pool = new pgMod.Pool(postgresPoolConfig(this.connection, this.readOnly))
+        // 空闲连接断开（服务端重启、NAT 断开、休眠唤醒）时绝不触发未捕获 error 事件导致宿主崩溃。
+        pool.on('error', () => {})
+        this.pool = pool
+        return pool
+      }).catch((error) => {
+        this.poolPromise = undefined
+        throw error
+      })
+    }
+    return await this.poolPromise
   }
   private async withSignalClient<T>(signal: AbortSignal | undefined, work: (client: pg.PoolClient, discard: () => void, isDiscarded: () => boolean) => Promise<T>): Promise<T> {
     signal?.throwIfAborted()
-    const client = await acquireWithSignal(() => this.pool.connect(), client => client.release(), signal)
+    const pool = this.pool ?? await this.getPool()
+    const client = await acquireWithSignal(() => pool.connect(), client => client.release(), signal)
     let destroyed = false
     let rejectAbort: (reason: unknown) => void = () => {}
     const aborted = new Promise<never>((_resolve, reject) => { rejectAbort = reject })
@@ -391,16 +840,40 @@ class PostgresAdapter implements DatabaseAdapter {
       if (!destroyed) client.release()
     }
   }
-  private async withReadOnlyClient<T>(signal: AbortSignal | undefined, work: (client: pg.PoolClient, discard: () => void) => Promise<T>): Promise<T> {
+  private async withReadOnlyClient<T>(
+    signal: AbortSignal | undefined,
+    timeoutMs: number | undefined,
+    work: (client: pg.PoolClient, discard: () => void, isDiscarded: () => boolean) => Promise<T>,
+  ): Promise<T> {
+    const validTimeout = validTimeoutMs(timeoutMs)
     return await this.withSignalClient(signal, async (client, discard, isDiscarded) => {
+      let inTransaction = false
+      let hasPrimaryError = false
       try {
-        await client.query('BEGIN READ ONLY')
-        return await work(client, discard)
+        try {
+          await client.query('BEGIN READ ONLY')
+          inTransaction = true
+        } catch (error) {
+          discard()
+          throw error
+        }
+        if (validTimeout !== undefined) {
+          await client.query('SET LOCAL statement_timeout = ' + validTimeout)
+        }
+        return await work(client, discard, isDiscarded)
+      } catch (error) {
+        hasPrimaryError = true
+        throw error
       } finally {
-        // Rollback also reverts set_config(..., false). A capped/cancelled query
-        // destroys its connection instead, causing server-side rollback.
-        if (!isDiscarded()) {
-          try { await client.query('ROLLBACK') } catch (error) { discard(); throw error }
+        // Rollback also reverts set_config(..., false) and SET LOCAL statement_timeout.
+        // A capped/cancelled query destroys its connection instead, causing server-side rollback.
+        if (inTransaction && !isDiscarded()) {
+          try {
+            await client.query('ROLLBACK')
+          } catch (rollbackError) {
+            discard()
+            if (!hasPrimaryError) throw rollbackError
+          }
         }
       }
     })
@@ -409,62 +882,184 @@ class PostgresAdapter implements DatabaseAdapter {
     const run = async (client: { query(query: any, values?: unknown[]): Promise<any> }): Promise<any> => {
       return values === undefined ? await client.query(query) : await client.query(query, values)
     }
-    if (signal === undefined) return await run(this.pool)
+    if (signal === undefined) return await run(this.pool ?? await this.getPool())
     return await this.withSignalClient(signal, run)
   }
-  async listTables(signal?: AbortSignal) {
-    const result = await this.queryWithSignal("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name", undefined, signal)
-    return result.rows.map((row: Record<string, unknown>) => String(row.table_name))
+  async listTables(signal?: AbortSignal, schema?: string) {
+    const targetSchema = parseOptionalSchema(schema)
+    const result = targetSchema !== undefined
+      ? await this.queryWithSignal(
+        'SELECT table_schema, table_name FROM information_schema.tables WHERE table_schema = $1 ORDER BY table_name',
+        [targetSchema],
+        signal,
+      )
+      : await this.queryWithSignal(
+        "SELECT table_schema, table_name FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog', 'information_schema') ORDER BY table_schema, table_name",
+        undefined,
+        signal,
+      )
+    return result.rows.map((row: Record<string, unknown>) => {
+      const tableSchema = row.table_schema !== null && row.table_schema !== undefined
+        ? String(row.table_schema)
+        : (targetSchema ?? 'public')
+      const tableName = String(row.table_name)
+      return tableSchema === 'public' ? tableName : tableSchema + '.' + tableName
+    })
   }
   async describeTable(table: string, signal?: AbortSignal) {
-    const name = assertIdentifier(table, '表名')
+    const ref = parseTableRef(table, '表名')
+    const schema = ref.schema ?? 'public'
     const result = await this.queryWithSignal(
-      `SELECT c.column_name, c.data_type, c.is_nullable,
+      `SELECT a.attname AS column_name,
+              pg_catalog.format_type(a.atttypid, a.atttypmod) AS data_type,
+              a.attnotnull AS not_null,
               EXISTS (
                 SELECT 1
-                FROM information_schema.table_constraints tc
-                JOIN information_schema.key_column_usage kcu
-                  ON tc.constraint_name = kcu.constraint_name
-                 AND tc.table_schema = kcu.table_schema
-                WHERE tc.table_schema = c.table_schema
-                  AND tc.table_name = c.table_name
-                  AND tc.constraint_type = 'PRIMARY KEY'
-                  AND kcu.column_name = c.column_name
-              ) AS is_primary
-         FROM information_schema.columns c
-        WHERE c.table_schema = 'public'
-          AND c.table_name = $1
-        ORDER BY c.ordinal_position`,
-      [name],
+                  FROM pg_catalog.pg_constraint con
+                 WHERE con.conrelid = c.oid
+                   AND con.contype = 'p'
+                   AND a.attnum = ANY(con.conkey)
+              ) AS is_primary,
+              pg_catalog.pg_get_expr(ad.adbin, ad.adrelid) AS default_value,
+              pg_catalog.col_description(c.oid, a.attnum) AS column_comment
+         FROM pg_catalog.pg_class c
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+         JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid
+         LEFT JOIN pg_catalog.pg_attrdef ad ON ad.adrelid = c.oid AND ad.adnum = a.attnum
+        WHERE n.nspname = $1
+          AND c.relname = $2
+          AND a.attnum > 0
+          AND NOT a.attisdropped
+        ORDER BY a.attnum`,
+      [schema, ref.table],
       signal,
     )
     return result.rows.map((row: Record<string, unknown>) => ({
       name: String(row.column_name),
       type: String(row.data_type ?? ''),
-      notNull: String(row.is_nullable) === 'NO',
+      notNull: row.not_null === true,
       primaryKey: row.is_primary === true,
+      defaultValue: row.default_value === null || row.default_value === undefined ? null : String(row.default_value),
+      comment: typeof row.column_comment === 'string' && row.column_comment !== '' ? row.column_comment : null,
     }))
   }
-  async query(sql: string, limit?: number, signal?: AbortSignal) {
-    return await this.withReadOnlyClient(signal, async (client, discard) => {
+  async describeTableDetail(table: string, signal?: AbortSignal): Promise<TableSchemaDetail> {
+    const ref = parseTableRef(table, '表名')
+    const schema = ref.schema ?? 'public'
+    const columns = await this.describeTable(table, signal)
+    const commentRes = await this.queryWithSignal(
+      `SELECT pg_catalog.obj_description(c.oid, 'pg_class') AS table_comment
+         FROM pg_catalog.pg_class c
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = $1
+          AND c.relname = $2
+        LIMIT 1`,
+      [schema, ref.table],
+      signal,
+    )
+    const rawComment = commentRes?.rows?.[0]?.table_comment
+    const comment = typeof rawComment === 'string' && rawComment !== '' ? rawComment : null
+    const indexRes = await this.queryWithSignal(
+      `SELECT i.relname AS index_name,
+              ix.indisunique AS is_unique,
+              COALESCE(
+                ARRAY(
+                  SELECT COALESCE(a.attname, pg_catalog.pg_get_indexdef(ix.indexrelid, k.ord::integer, true))
+                    FROM unnest(ix.indkey::smallint[]) WITH ORDINALITY AS k(attnum, ord)
+                    LEFT JOIN pg_catalog.pg_attribute a
+                      ON a.attrelid = t.oid AND a.attnum = k.attnum AND k.attnum > 0
+                   ORDER BY k.ord
+                ),
+                ARRAY[]::text[]
+              ) AS index_columns
+         FROM pg_catalog.pg_class t
+         JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace
+         JOIN pg_catalog.pg_index ix ON ix.indrelid = t.oid
+         JOIN pg_catalog.pg_class i ON i.oid = ix.indexrelid
+        WHERE n.nspname = $1
+          AND t.relname = $2
+        ORDER BY i.relname`,
+      [schema, ref.table],
+      signal,
+    )
+    const indexes: IndexInfo[] = (indexRes?.rows ?? []).map((row: Record<string, unknown>) => ({
+      name: String(row.index_name ?? ''),
+      unique: row.is_unique === true,
+      columns: Array.isArray(row.index_columns) ? row.index_columns.map(String) : [],
+    }))
+    const fkRes = await this.queryWithSignal(
+      `SELECT a.attname AS column_name,
+              CASE WHEN fn.nspname = 'public' THEN fc.relname ELSE fn.nspname || '.' || fc.relname END AS ref_table,
+              fa.attname AS ref_column
+         FROM pg_catalog.pg_constraint con
+         JOIN pg_catalog.pg_class c ON c.oid = con.conrelid
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+         JOIN pg_catalog.pg_class fc ON fc.oid = con.confrelid
+         JOIN pg_catalog.pg_namespace fn ON fn.oid = fc.relnamespace
+         JOIN unnest(con.conkey, con.confkey) WITH ORDINALITY AS cols(col_attnum, ref_attnum, ord) ON true
+         JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = cols.col_attnum
+         JOIN pg_catalog.pg_attribute fa ON fa.attrelid = fc.oid AND fa.attnum = cols.ref_attnum
+        WHERE n.nspname = $1
+          AND c.relname = $2
+          AND con.contype = 'f'
+        ORDER BY con.conname, cols.ord`,
+      [schema, ref.table],
+      signal,
+    )
+    const foreignKeys: ForeignKeyInfo[] = (fkRes?.rows ?? []).map((row: Record<string, unknown>) => ({
+      column: String(row.column_name ?? ''),
+      refTable: String(row.ref_table ?? ''),
+      refColumn: String(row.ref_column ?? ''),
+    }))
+    return {
+      table: ref.table,
+      schema,
+      comment,
+      columns,
+      indexes,
+      foreignKeys,
+    }
+  }
+  async query(sql: string, limit?: number, signal?: AbortSignal, options?: QueryOptions) {
+    const params = options?.params
+    return await this.withReadOnlyClient(signal, options?.timeoutMs, async (client, discard, isDiscarded) => {
       if (limit === undefined || limit <= 0) {
-        const queryConfig: pg.QueryArrayConfig & { queryMode: 'extended' } = { text: sql, rowMode: 'array', queryMode: 'extended' }
+        const queryConfig: pg.QueryArrayConfig & { queryMode: 'extended' } = {
+          text: sql,
+          rowMode: 'array',
+          queryMode: 'extended',
+        }
+        if (params !== undefined && params.length > 0) queryConfig.values = params
         const result = await client.query(queryConfig)
         return { columns: result.fields.map((field: { name: string }) => field.name), rows: result.rows.map((row: unknown[]) => row.map(toValue)) }
       }
-      return await streamPostgresQuery(client, sql, limit, discard)
+      return await streamPostgresQuery(client, sql, limit, discard, isDiscarded, params)
     })
   }
-  async exec(sql: string, signal?: AbortSignal) {
+  async exec(sql: string, signal?: AbortSignal, options?: ExecOptions) {
     if (this.readOnly) throw new Error('当前配置 readOnly=true，禁止写入数据库。')
-    const result = await this.queryWithSignal(sql, undefined, signal)
-    return Number(result.rowCount ?? 0)
+    signal?.throwIfAborted()
+    const stmts = splitSqlStatements(sql, 'postgres')
+    if (stmts.length === 0) return 0
+    const params = options?.params
+    if (params !== undefined && params.length > 0 && stmts.length > 1) {
+      throw new Error('带参数（params）的 sql_exec 仅支持单条语句。')
+    }
+    const result = await this.queryWithSignal(sql, params !== undefined && params.length > 0 ? params : undefined, signal)
+    if (Array.isArray(result)) {
+      return result.reduce((acc, item) => acc + Number(item?.rowCount ?? 0), 0)
+    }
+    return Number(result?.rowCount ?? 0)
   }
   async ping(signal?: AbortSignal) {
     await this.queryWithSignal('SELECT 1', undefined, signal)
   }
   async close() {
-    await this.pool.end()
+    const pending = this.poolPromise
+    this.poolPromise = undefined
+    const pool = this.pool ?? (pending ? await pending.catch(() => undefined) : undefined)
+    this.pool = undefined
+    if (pool !== undefined) await pool.end()
   }
 }
 

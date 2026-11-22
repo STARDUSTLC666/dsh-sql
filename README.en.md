@@ -30,9 +30,9 @@ For the web profile, replace `desktop` with `web`. Restart DSH once after instal
 <a id="start-using-it"></a>
 ## Get Started in 3 Steps
 
-1. **Add your database in DSH Settings (applies live)**: Open **DSH Settings → Plugins → SQL (`dsh-sql`)** and add your SQLite file, MySQL, or PostgreSQL connection (passwords are masked and can also come from `DSH_SQL_PASSWORD_<NAME>`; turn on `readOnly` for production databases).
-2. **Explore schema & table sizes first**: Ask the assistant to check database health, list tables, and inspect column types before writing queries.
-3. **Query safely, approve writes explicitly**: Read queries run inside read-only transactions with automatic row caps; writes show every SQL statement in a confirmation prompt before executing.
+1. **Add your database in DSH Settings (applies live)**: Open **DSH Settings → Plugins → SQL (`dsh-sql`)** and add SQLite, MySQL, or PostgreSQL connections (also supports `url` connection URIs and cloud DB `ssl` modes `disable` / `require` / `verify-full`; passwords are masked or read from `DSH_SQL_PASSWORD_<NAME>`; lock writes globally or per connection with `readOnly`).
+2. **Explore schema & table sizes first**: Ask the assistant to check database health, filter tables by `schema` / `pattern`, and inspect columns, defaults, comments, indexes, and foreign keys before writing queries.
+3. **Query safely, approve writes explicitly**: `sql_query` supports `limit`, parameterized `params`, and `table`/`csv`/`json` output, backed by engine-level read-only enforcement (SQLite `PRAGMA query_only`, MySQL/PostgreSQL independent `READ ONLY` transactions) and server-side query timeouts; `sql_exec` supports parameterized writes and multi-statement scripts across all three engines, showing the target connection and every SQL statement in the approval card before executing.
 
 ## Copy-Ready Prompts for Everyday Work
 
@@ -49,6 +49,7 @@ For the web profile, replace `desktop` with `web`. Restart DSH once after instal
 | :--- | :--- | :--- |
 | Only `default (:memory:)` appears with 0 tables | No external database configured yet | Add your connection in **DSH Settings → Plugins → SQL** and save (applies live) |
 | `ECONNREFUSED` / `ETIMEDOUT` | DB server stopped, wrong `host`/`port`, or firewall | Verify host, port, and server status in Settings, then re-run health check |
+| TLS/SSL handshake or certificate error | Cloud DB requires TLS or self-signed cert failed verification | Set `ssl` on the connection (`require` or `verify-full` for cloud DBs; `{ rejectUnauthorized: false }` or `ca` for self-signed certs; `disable` only on trusted local networks) |
 | `Access denied` / `password authentication failed` | Wrong username or password | Update `user`/`password` in Settings or set `DSH_SQL_PASSWORD_<CONNECTION_UPPER>` |
 | Write says confirmation is unavailable (`never`) | Session policy blocks interactive approval prompts | Switch to an interactive (`ask`) session mode so write approval cards can appear |
 

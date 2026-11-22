@@ -1,5 +1,5 @@
-import mysql from 'mysql2/promise';
-import pg from 'pg';
+import type mysql from 'mysql2/promise';
+import type pg from 'pg';
 import { type SqlConnectionConfig } from './config.js';
 /** 查询结果：列名 + 行（值数组，无损 JSON 友好）。 */
 export interface QueryResult {
@@ -12,14 +12,48 @@ export interface ColumnInfo {
     type: string;
     notNull: boolean;
     primaryKey: boolean;
+    defaultValue?: string | null;
+    comment?: string | null;
+}
+/** 索引元数据。 */
+export interface IndexInfo {
+    name: string;
+    unique: boolean;
+    columns: string[];
+}
+/** 外键元数据。 */
+export interface ForeignKeyInfo {
+    column: string;
+    refTable: string;
+    refColumn: string;
+}
+/** 完整表结构详情（列、索引、外键、表注释）。 */
+export interface TableSchemaDetail {
+    table: string;
+    schema?: string;
+    comment?: string | null;
+    columns: ColumnInfo[];
+    indexes: IndexInfo[];
+    foreignKeys: ForeignKeyInfo[];
+}
+/** 查询附加选项（参数绑定与服务端超时）。 */
+export interface QueryOptions {
+    params?: unknown[];
+    timeoutMs?: number;
+}
+/** 写执行附加选项（参数绑定与超时）。 */
+export interface ExecOptions {
+    params?: unknown[];
+    timeoutMs?: number;
 }
 /** 统一适配器接口。 */
 export interface DatabaseAdapter {
     engine: 'sqlite' | 'mysql' | 'postgres';
-    listTables(signal?: AbortSignal): Promise<string[]>;
+    listTables(signal?: AbortSignal, schema?: string): Promise<string[]>;
     describeTable(table: string, signal?: AbortSignal): Promise<ColumnInfo[]>;
-    query(sql: string, limit?: number, signal?: AbortSignal): Promise<QueryResult>;
-    exec(sql: string, signal?: AbortSignal): Promise<number>;
+    describeTableDetail?(table: string, signal?: AbortSignal): Promise<TableSchemaDetail>;
+    query(sql: string, limit?: number, signal?: AbortSignal, options?: QueryOptions): Promise<QueryResult>;
+    exec(sql: string, signal?: AbortSignal, options?: ExecOptions): Promise<number>;
     ping(signal?: AbortSignal): Promise<void>;
     close(): Promise<void>;
 }

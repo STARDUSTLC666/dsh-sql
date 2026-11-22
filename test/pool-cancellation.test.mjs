@@ -37,3 +37,11 @@ test('late acquisition failures after cancellation are observed', { timeout: 100
     await new Promise(resolve => setImmediate(resolve))
   }
 })
+
+test('closing an uninitialized MySQL/PostgreSQL adapter succeeds immediately without creating a pool', async () => {
+  for (const engine of ['mysql', 'postgres']) {
+    const adapter = createAdapter({ name: 'lazy-close', engine, database: 'app' })
+    await adapter.close()
+    assert.equal(adapter.pool, undefined)
+  }
+})

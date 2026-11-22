@@ -30,9 +30,9 @@ dsh plugin --profile desktop add dsh-sql
 <a id="开始使用"></a>
 ## 最快 3 步用起来
 
-1. **在原生设置添加数据库连接（保存即生效）**：打开 DSH「**设置 → 插件 → 数据库（dsh-sql）**」，添加你的 SQLite 文件、MySQL 或 PostgreSQL 连接（密码自动脱敏，也可用环境变量 `DSH_SQL_PASSWORD_<连接名大写>`；生产库可一键勾选 `readOnly` 彻底锁死写入）。
-2. **先探查结构与规模**：让助手先跑连通性自检，列出表清单与字段定义，再查业务数据，避免盲猜表名或扫崩大表。
-3. **只读回答日常问题，写操作逐条审批**：查询自动走只读事务与行数上限保护；确需修改数据时，助手会在审批卡完整列出每条 SQL 语句，经你确认后才执行。
+1. **在原生设置添加数据库连接（保存即生效）**：打开 DSH「**设置 → 插件 → 数据库（dsh-sql）**」，添加 SQLite 文件、MySQL 或 PostgreSQL 连接（支持直接粘贴 `url` 连接串，云数据库可配 `ssl` 模式 `disable` / `require` / `verify-full`；密码自动脱敏，也可用环境变量 `DSH_SQL_PASSWORD_<连接名大写>`；支持全局或单连接 `readOnly` 锁死写入）。
+2. **先探查结构与规模**：让助手先跑连通性自检，按 `schema` / `pattern` 列出表清单并查看字段、默认值、注释、索引与外键，再查业务数据，避免盲猜表名或扫崩大表。
+3. **只读回答日常问题，写操作逐条审批**：`sql_query` 支持 `limit`、参数化 `params` 与 `table`/`csv`/`json` 格式，自动走引擎级只读保护（SQLite `PRAGMA query_only`、MySQL/PostgreSQL 独立只读事务）与服务端查询超时；确需修改数据时，`sql_exec` 支持参数化写入与三引擎多语句脚本，审批卡会标明目标连接并完整列出每条 SQL，经你确认后才执行。
 
 ## 平时怎么对助手说（可直接复制的自然语言示例）
 
@@ -49,6 +49,7 @@ dsh plugin --profile desktop add dsh-sql
 | :--- | :--- | :--- |
 | 只看到 `default (:memory:)` 且没有业务表 | 还没配置外部数据库连接，当前在用内置临时内存库 | 打开 DSH「设置 → 插件 → 数据库」添加连接并保存（立即生效，无需重启） |
 | `ECONNREFUSED` / `ETIMEDOUT` | 数据库未启动、`host`/`port` 填错或防火墙拦截 | 核对服务端口与连接配置后重新运行自检 |
+| TLS/SSL 握手或证书校验失败 | 云数据库要求加密连接，或自签名证书未通过校验 | 在连接配置中设置 `ssl`（云库常用 `require` 或 `verify-full`，自签名可用 `{ rejectUnauthorized: false }` 或配置 `ca` 证书；仅本地可信网络设 `disable`） |
 | `Access denied` / `password authentication failed` | 用户名或密码错误 | 在「设置 → 插件 → 数据库」重填密码，或设置环境变量 `DSH_SQL_PASSWORD_<连接名大写>` |
 | 写操作提示「当前策略 never 无法询问」 | 会话处于不弹窗模式，写审批门为安全拒绝静默执行 | 切回可询问（ask）会话模式，使审批卡正常弹出 |
 

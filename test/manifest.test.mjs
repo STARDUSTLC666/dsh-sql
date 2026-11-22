@@ -41,7 +41,7 @@ test('Cordis 4 ctx.effect 异步卸载时关闭数据库连接并注销工具', 
     },
     on() { return () => {} },
     effect(fn) { effects.push(fn()) },
-  }, { connections: { mem: { engine: 'sqlite', file: ':memory:' } } })
+  }, { connections: [{ name: 'mem', engine: 'sqlite', file: ':memory:' }] })
   assert.equal(active.size, 6)
   for (const dispose of effects) await dispose?.()
   assert.equal(active.size, 0)

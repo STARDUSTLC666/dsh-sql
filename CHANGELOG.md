@@ -1,5 +1,12 @@
 # 更新记录
 
+## 0.7.0 (2026-11-22)
+
+- 安全护栏加固：新增方言感知 SQL 词法模块 `sql-lexer`，修复块注释词元粘连、MySQL 条件注释与双引号反斜杠、PostgreSQL `U&'...'` / `#` 运算符与 `DESCRIBE`/`DESC` 写扫描绕过，同时消除 `REPLACE(...)`、`(SELECT ...) UNION (...)` 与 `EXPLAIN ANALYZE SELECT` 等高频只读误杀；SQLite 每次只读查询同步下沉 `PRAGMA query_only = ON` 并补齐 `:memory:` 只读写入拦截。
+- 稳定性与热更新修复：为 `pg.Pool` 挂载 `error` 监听防止空闲断连崩溃宿主；修复 `writeApproval` 由 `false → true` 热更新不生效的问题，并在写审批卡补充目标连接信息与按引擎精准拆句；配置热更新时自动关闭并回收已删除/改名的旧连接池，`queryTimeoutMs` / `execTimeoutMs` 实时生效并下沉至服务端超时。
+- 三引擎与查询体验升级：支持连接级 `readOnly`、云数据库 `ssl` 与 `url` 连接串配置；支持 SQLite / MySQL / PostgreSQL 多语句写操作与准确影响行数统计；`sql_query` 新增 `limit` / `params` 参数、修复截断 `rowCount` 语义、`jsonb` 对象渲染与大 BLOB/单元格截断；`sql_schema` 支持 PostgreSQL 多 Schema、`schema`/`pattern` 过滤与默认值/注释/索引/外键元数据；`sql_list` / `sql_health` 改为并发探活，`mysql2`/`pg` 改为按需懒加载。
+- Security, reliability & capability release: extract dialect-aware `sql-lexer` closing comment-glue, MySQL conditional-comment/quote, PostgreSQL `U&'...'`/`#`, and `DESCRIBE` read-guard bypasses while removing `REPLACE(...)` and `EXPLAIN ANALYZE SELECT` false positives; enforce SQLite `PRAGMA query_only = ON`, attach `pg.Pool` idle `error` listener, fix `writeApproval` `false → true` hot-reload, evict stale pools, and add per-connection `readOnly`, cloud `ssl`, `url` URIs, rich `sql_schema` metadata, parameterized queries, multi-statement writes across all three engines, concurrent health pings, and lazy driver loading.
+
 ## 0.6.7 (2026-11-20)
 
 - 升级共享更新组件至 0.2.10，移除跨插件右下角浮动提醒，保留工作台及插件详情页更新控制。
