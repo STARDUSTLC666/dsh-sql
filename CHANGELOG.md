@@ -1,5 +1,10 @@
 # 更新记录
 
+## 0.7.1 (2026-11-22)
+
+- 修复 Node 22 下 `AbortSignal.timeout()` 定时器未保活事件循环导致超时探活提前退出的兼容问题，改用可及时清理的 `createTimeoutScope` 并在操作结束立即释放定时器。
+- Fix Node 22 compatibility where unref'd `AbortSignal.timeout()` timers could let pending ping timeouts resolve the event loop early; replace with an explicitly disposed `createTimeoutScope` that clears timers immediately on completion.
+
 ## 0.7.0 (2026-11-22)
 
 - 安全护栏加固：新增方言感知 SQL 词法模块 `sql-lexer`，修复块注释词元粘连、MySQL 条件注释与双引号反斜杠、PostgreSQL `U&'...'` / `#` 运算符与 `DESCRIBE`/`DESC` 写扫描绕过，同时消除 `REPLACE(...)`、`(SELECT ...) UNION (...)` 与 `EXPLAIN ANALYZE SELECT` 等高频只读误杀；SQLite 每次只读查询同步下沉 `PRAGMA query_only = ON` 并补齐 `:memory:` 只读写入拦截。
