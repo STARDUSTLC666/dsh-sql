@@ -3,7 +3,19 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { assertReadQuery, buildSqlTools, Config, liveConfig, parseTableRef, resolveConfig } from '../lib/index.js'
+import {
+  analyzeWriteRisks,
+  assertReadQuery,
+  buildSqlTools,
+  Config,
+  DEFAULT_REDACT_COLUMN_PATTERNS,
+  isCursorEligibleQuery,
+  liveConfig,
+  matchRedactedColumns,
+  parseTableRef,
+  resolveConfig,
+  toMarkdownTable,
+} from '../lib/index.js'
 
 const kVolatileWrite = Symbol.for('cosmokit.volatile.write')
 
@@ -58,10 +70,16 @@ test('每个工具 schema 是 object JSON Schema，且保留 enum / items / mini
     assert.equal(typeof tool.output.render, 'function')
     assert.equal(typeof tool.execute, 'function')
   }
-  assert.deepEqual(query.parameters.properties.format.enum, ['table', 'csv', 'json'])
+  assert.deepEqual(query.parameters.properties.format.enum, ['table', 'markdown', 'csv', 'json'])
   assert.equal(query.parameters.properties.limit.minimum, 1)
   assert.deepEqual(query.parameters.properties.params.items, {})
   assert.deepEqual(exec.parameters.properties.params.items, {})
+  assert.deepEqual(schema.parameters.properties.tables.items, { type: 'string' })
+  assert.equal(typeof analyzeWriteRisks, 'function')
+  assert.equal(typeof isCursorEligibleQuery, 'function')
+  assert.equal(typeof toMarkdownTable, 'function')
+  assert.ok(Array.isArray(DEFAULT_REDACT_COLUMN_PATTERNS) && DEFAULT_REDACT_COLUMN_PATTERNS.length > 0)
+  assert.equal(typeof matchRedactedColumns, 'function')
 })
 
 test('sql_list：连接健康', async () => {
@@ -106,7 +124,7 @@ test('sql_query 支持 limit、params 与参数化 sql_exec，拒绝非法 limit
   await assert.rejects(() => query.execute({ sql: 'SELECT 1', limit: 0 }), /大于等于 1/)
   await assert.rejects(() => query.execute({ sql: 'SELECT 1', limit: 1.5 }), /大于等于 1/)
   await assert.rejects(() => query.execute({ sql: 'SELECT 1', params: 'bad' }), /params 必须是数组/)
-  await assert.rejects(() => query.execute({ sql: 'SELECT 1', format: 'xml' }), /不支持的 format.*table \/ csv \/ json/)
+  await assert.rejects(() => query.execute({ sql: 'SELECT 1', format: 'xml' }), /不支持的 format.*table \/ markdown \/ csv \/ json/)
 
   // 参数化查询与参数化写入
   const paramRes = await query.execute({ sql: 'SELECT id, label FROM items WHERE label = ?', params: ['b'] })
@@ -121,16 +139,192 @@ test('sql_query 支持 limit、params 与参数化 sql_exec，拒绝非法 limit
   assert.equal(verify.rows[0][0], 'param-d')
 })
 
-test('sql_query 截断提示在 table / csv / json 三种格式下均有渲染', async () => {
-  for (const format of ['table', 'csv', 'json']) {
+test('sql_query 截断提示在 table / markdown / csv / json 四种格式下均有渲染', async () => {
+  for (const format of ['table', 'markdown', 'csv', 'json']) {
     const value = await query.execute({
       sql: 'SELECT id, label FROM items ORDER BY id',
       ...(format === 'table' ? {} : { format }),
     })
     assert.equal(value.truncated, true)
     assert.equal(value.rowCount, 2)
+    assert.equal(Number.isInteger(value.durationMs), true)
+    assert.ok(value.durationMs >= 0)
     const rendered = query.output.render({}, value)[0].text
     assert.match(rendered, /已达上限 2 行/, 'format=' + format)
+    assert.match(rendered, /耗时 \d+ms/, 'format=' + format)
+  }
+})
+
+test('sql_exec 与 sql_query 均返回非负整数 durationMs 并在渲染头中展示', async () => {
+  const execRes = await exec.execute({ sql: "UPDATE items SET label = 'a' WHERE id = 1" })
+  assert.equal(Number.isInteger(execRes.durationMs), true)
+  assert.ok(execRes.durationMs >= 0)
+  const execText = exec.output.render({}, execRes)[0].text
+  assert.match(execText, /耗时 \d+ms/)
+
+  const queryRes = await query.execute({ sql: 'SELECT id, label FROM items ORDER BY id' })
+  assert.equal(Number.isInteger(queryRes.durationMs), true)
+  assert.ok(queryRes.durationMs >= 0)
+  const queryText = query.output.render({}, queryRes)[0].text
+  assert.match(queryText, /耗时 \d+ms/)
+  assert.match(queryText, /\| id \| label \|/)
+  assert.match(queryText, /\| --- \| --- \|/)
+})
+
+test('toMarkdownTable 与 format=markdown：正确转义管道符/换行/孤立回车、处理空列/空行与极端对象', async () => {
+  assert.equal(toMarkdownTable([], []), '')
+  assert.equal(toMarkdownTable(['a', 'b'], []), '| a | b |\n| --- | --- |')
+  assert.equal(
+    toMarkdownTable(['col|1', 'col2'], [['val|a', 'line1\nline2'], [null, { k: 'v|1' }]]),
+    [
+      '| col\\|1 | col2 |',
+      '| --- | --- |',
+      '| val\\|a | line1\\nline2 |',
+      '| NULL | {"k":"v\\|1"} |',
+    ].join('\n'),
+  )
+
+  // 孤立 \r 必须转义避免破坏 GFM 行结构；toJSON 返回 undefined 或 null 原型 + BigInt/循环引用不得崩溃
+  const nullProtoBigInt = Object.assign(Object.create(null), { n: 1n })
+  const nullProtoCyclic = Object.create(null)
+  nullProtoCyclic.self = nullProtoCyclic
+  const undefJson = { toJSON() { return undefined } }
+  const edgeMd = toMarkdownTable(
+    ['cr', 'undef_json', 'null_bigint', 'null_cyclic'],
+    [['line1\rline2\r\nline3', undefJson, nullProtoBigInt, nullProtoCyclic]],
+  )
+  assert.equal(edgeMd.includes('\r'), false, 'Markdown 表格中不得残留孤立 \\r')
+  assert.ok(edgeMd.includes('| line1\\nline2\\nline3 | [object Object] | [object Object] | [object Object] |'))
+
+  const mdRes = await query.execute({
+    sql: "SELECT 'x|y' AS pipe_col, 'hello\nworld' AS multi_col, NULL AS empty_col",
+    format: 'markdown',
+  })
+  assert.equal(mdRes.format, 'markdown')
+  assert.equal(
+    mdRes.formatted,
+    '| pipe_col | multi_col | empty_col |\n| --- | --- | --- |\n| x\\|y | hello\\nworld | NULL |',
+  )
+  const rendered = query.output.render({}, mdRes)[0].text
+  assert.match(rendered, /markdown 格式/)
+  assert.ok(rendered.includes('| x\\|y | hello\\nworld | NULL |'))
+})
+
+test('sql_query 敏感列脱敏（redactColumns=true 与自定义规则）：覆盖 table/markdown/csv/json，保留 NULL 并报告 redactedColumns', async () => {
+  const localDir = mkdtempSync(join(tmpdir(), 'dsh-sql-redact-'))
+  const dbFile = join(localDir, 'redact.db')
+  const rwTools = buildSqlTools(resolveConfig({ connections: [{ name: 'r', engine: 'sqlite', file: dbFile }] }))
+  const defaultRedact = buildSqlTools(resolveConfig({
+    connections: [{ name: 'r', engine: 'sqlite', file: dbFile }],
+    redactColumns: true,
+  }))
+  const customRedact = buildSqlTools(resolveConfig({
+    connections: [{ name: 'r', engine: 'sqlite', file: dbFile }],
+    redactColumns: ['phone', '/^id_card$/i'],
+  }))
+  try {
+    const rwExec = rwTools.tools.find((t) => t.name === 'sql_exec')
+    const rwQuery = rwTools.tools.find((t) => t.name === 'sql_query')
+    await rwExec.execute({
+      sql: 'CREATE TABLE accounts (id INTEGER PRIMARY KEY, username TEXT, password_hash TEXT, api_key TEXT, phone TEXT, id_card TEXT)',
+    })
+    await rwExec.execute({
+      sql: "INSERT INTO accounts (username, password_hash, api_key, phone, id_card) VALUES ('alice', 'secret123', NULL, '13800138000', '110101199001011234')",
+    })
+
+    // 未开启脱敏时原文返回且无 redactedColumns
+    const raw = await rwQuery.execute({ sql: 'SELECT username, password_hash, api_key FROM accounts' })
+    assert.equal(raw.rows[0][1], 'secret123')
+    assert.equal(raw.redactedColumns, undefined)
+
+    // redactColumns: true 跨全部 4 种格式脱敏非空值、保留 NULL
+    const defQuery = defaultRedact.tools.find((t) => t.name === 'sql_query')
+    for (const format of ['table', 'markdown', 'csv', 'json']) {
+      const res = await defQuery.execute({
+        sql: 'SELECT username, password_hash, api_key FROM accounts',
+        ...(format === 'table' ? {} : { format }),
+      })
+      assert.deepEqual(res.redactedColumns, ['password_hash', 'api_key'])
+      assert.deepEqual(res.rows, [['alice', '[REDACTED]', null]])
+      const rendered = defQuery.output.render({}, res)[0].text
+      assert.match(rendered, /已脱敏列：password_hash, api_key/)
+      assert.equal(rendered.includes('secret123'), false, 'format=' + format + ' 不得泄露原文')
+      if (format === 'json') {
+        assert.deepEqual(JSON.parse(res.formatted), [{ username: 'alice', password_hash: '[REDACTED]', api_key: null }])
+      } else if (format === 'csv') {
+        assert.equal(res.formatted, 'username,password_hash,api_key\nalice,[REDACTED],')
+      } else if (format === 'markdown') {
+        assert.equal(res.formatted, '| username | password_hash | api_key |\n| --- | --- | --- |\n| alice | [REDACTED] | NULL |')
+      }
+    }
+
+    // 自定义子串 + 正则规则，且同名列去重保留列序
+    const custQuery = customRedact.tools.find((t) => t.name === 'sql_query')
+    const custRes = await custQuery.execute({
+      sql: 'SELECT username, phone, id_card, phone AS phone, password_hash FROM accounts',
+      format: 'json',
+    })
+    assert.deepEqual(custRes.redactedColumns, ['phone', 'id_card'])
+    assert.deepEqual(custRes.rows, [['alice', '[REDACTED]', '[REDACTED]', '[REDACTED]', 'secret123']])
+    assert.deepEqual(JSON.parse(custRes.formatted), {
+      columns: ['username', 'phone', 'id_card', 'phone', 'password_hash'],
+      rows: [['alice', '[REDACTED]', '[REDACTED]', '[REDACTED]', 'secret123']],
+    })
+  } finally {
+    for (const a of rwTools.adapters.values()) await a.close()
+    for (const a of defaultRedact.adapters.values()) await a.close()
+    for (const a of customRedact.adapters.values()) await a.close()
+    rmSync(localDir, { recursive: true, force: true })
+  }
+})
+
+test('sql_query 对无参 PostgreSQL 查询启用 useCursor=true，有参或非 PG 查询不启用', async () => {
+  const multiCfg = resolveConfig({
+    connections: [
+      { name: 'pg', engine: 'postgres', database: 'app' },
+      { name: 'my', engine: 'mysql', database: 'shop' },
+      { name: 'sq', engine: 'sqlite', file: ':memory:' },
+    ],
+  })
+  const { tools: mTools, adapters: mAdapters } = buildSqlTools(multiCfg)
+  const captured = []
+  const makeMockAdapter = (engine) => ({
+    engine,
+    async listTables() { return [] },
+    async describeTable() { return [] },
+    async query(sql, limit, _signal, options) {
+      captured.push({ engine, sql, limit, options })
+      return { columns: ['id'], rows: [[1]] }
+    },
+    async exec() { return 0 },
+    async ping() {},
+    async close() {},
+  })
+  mAdapters.set('pg', makeMockAdapter('postgres'))
+  mAdapters.set('my', makeMockAdapter('mysql'))
+  mAdapters.set('sq', makeMockAdapter('sqlite'))
+
+  const mQuery = mTools.find((t) => t.name === 'sql_query')
+  try {
+    // PG 无参 -> useCursor: true
+    await mQuery.execute({ connection: 'pg', sql: 'SELECT 1' })
+    assert.equal(captured.at(-1).options.useCursor, true)
+
+    // PG 空参数数组 -> useCursor: true
+    await mQuery.execute({ connection: 'pg', sql: 'SELECT 1', params: [] })
+    assert.equal(captured.at(-1).options.useCursor, true)
+
+    // PG 有参数 -> 不设 useCursor
+    await mQuery.execute({ connection: 'pg', sql: 'SELECT $1', params: [42] })
+    assert.equal(captured.at(-1).options.useCursor, undefined)
+
+    // MySQL / SQLite 无参 -> 不设 useCursor
+    await mQuery.execute({ connection: 'my', sql: 'SELECT 1' })
+    assert.equal(captured.at(-1).options.useCursor, undefined)
+    await mQuery.execute({ connection: 'sq', sql: 'SELECT 1' })
+    assert.equal(captured.at(-1).options.useCursor, undefined)
+  } finally {
+    for (const a of mAdapters.values()) await a.close()
   }
 })
 
@@ -200,7 +394,8 @@ test('sql_schema 支持 pattern 过滤与富结构（索引/外键/默认值/注
     assert.match(logsRendered, /外键（1）/)
     assert.match(logsRendered, /user_id -> users\.id/)
 
-    // 富结构渲染（含 schema / 表注释 / 列注释 / 默认值 / 索引 / 外键）
+    // 富结构渲染（含 schema / 表注释 / 列注释 / 默认值 / PG enumValues / 索引 / 外键）
+    const manyEnums = Array.from({ length: 14 }, (_, i) => 'v' + (i + 1))
     const richRendered = localSchema.output.render({}, {
       connection: 'sc',
       table: 'events',
@@ -208,7 +403,8 @@ test('sql_schema 支持 pattern 过滤与富结构（索引/外键/默认值/注
       comment: '埋点事件表',
       columns: [
         { name: 'id', type: 'bigint', notNull: true, primaryKey: true, defaultValue: null, comment: '主键 ID' },
-        { name: 'status', type: 'text', notNull: true, primaryKey: false, defaultValue: "'open'", comment: '状态' },
+        { name: 'status', type: 'event_status', notNull: true, primaryKey: false, defaultValue: "'open'", enumValues: ['open', 'closed', 'archived'], comment: '状态' },
+        { name: 'category', type: 'cat_enum', notNull: false, primaryKey: false, enumValues: manyEnums },
       ],
       indexes: [{ name: 'idx_events_status', unique: false, columns: ['status'] }],
       foreignKeys: [{ column: 'user_id', refTable: 'users', refColumn: 'id' }],
@@ -216,12 +412,107 @@ test('sql_schema 支持 pattern 过滤与富结构（索引/外键/默认值/注
     })[0].text
     assert.match(richRendered, /analytics\.events（埋点事件表）/)
     assert.match(richRendered, /默认: 'open'/)
+    assert.match(richRendered, /（枚举：open, closed, archived）/)
+    assert.match(richRendered, /（枚举：v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, …）/)
     assert.match(richRendered, /主键 ID/)
     assert.match(richRendered, /idx_events_status.*\(status\)/)
     assert.match(richRendered, /user_id -> users\.id/)
+
+    // 批量 tables 查询：并发读取多张表，缺失表不中断其余表
+    const batch = await localSchema.execute({ tables: ['users', 'user_logs', 'missing'] })
+    assert.equal(batch.connection, 'sc')
+    assert.deepEqual(batch.tables, [])
+    assert.deepEqual(batch.columns, [])
+    assert.equal(batch.tableDetails.length, 3)
+    assert.equal(batch.tableDetails[0].table, 'users')
+    assert.ok(batch.tableDetails[0].indexes.some((idx) => idx.name === 'idx_users_email'))
+    assert.equal(batch.tableDetails[1].table, 'user_logs')
+    assert.ok(batch.tableDetails[1].foreignKeys.some((fk) => fk.refTable === 'users'))
+    assert.equal(batch.tableDetails[2].table, 'missing')
+    assert.deepEqual(batch.tableDetails[2].columns, [])
+    const batchRendered = localSchema.output.render({}, batch)[0].text
+    assert.match(batchRendered, /批量表结构（共 3 张）/)
+    assert.match(batchRendered, /### users/)
+    assert.match(batchRendered, /### user_logs/)
+    assert.match(batchRendered, /### missing/)
+    assert.match(batchRendered, /未找到该表的列/)
+
+    // table 优先级高于 tables
+    const singlePriority = await localSchema.execute({ table: 'users', tables: ['orders'] })
+    assert.equal(singlePriority.table, 'users')
+    assert.equal(singlePriority.tableDetails, undefined)
+
+    // tables 参数校验（非数组、空数组、超过 20 张、空字符串项）
+    await assert.rejects(() => localSchema.execute({ tables: 'users' }), /非空字符串数组/)
+    await assert.rejects(() => localSchema.execute({ tables: [] }), /不能为空数组/)
+    await assert.rejects(() => localSchema.execute({ tables: Array.from({ length: 21 }, (_, i) => 't' + i) }), /最多支持批量查看 20 张/)
+    await assert.rejects(() => localSchema.execute({ tables: ['users', ''] }), /非空表名字符串/)
   } finally {
     for (const a of localAdapters.values()) await a.close()
     rmSync(localDir, { recursive: true, force: true })
+  }
+})
+
+test('sql_schema 批量 tables 并发单表异常隔离 + schema 限定 + enumValues 渲染', async () => {
+  const pgCfg = resolveConfig({ connections: [{ name: 'pg', engine: 'postgres', database: 'app' }] })
+  const { tools: pgTools, adapters: pgAdapters } = buildSqlTools(pgCfg)
+  const seenRefs = []
+  pgAdapters.set('pg', {
+    engine: 'postgres',
+    async listTables() { return [] },
+    async describeTable() { return [] },
+    async describeTableDetail(tableRef) {
+      seenRefs.push(tableRef)
+      const parsed = parseTableRef(tableRef, '表名')
+      if (parsed.table === 'broken') {
+        throw new Error('permission denied for table broken')
+      }
+      return {
+        table: parsed.table,
+        schema: parsed.schema,
+        columns: [
+          { name: 'id', type: 'integer', notNull: true, primaryKey: true },
+          { name: 'state', type: 'order_state', notNull: true, primaryKey: false, enumValues: ['new', 'paid'] },
+        ],
+        indexes: [],
+        foreignKeys: [],
+      }
+    },
+    async query() { return { columns: [], rows: [] } },
+    async exec() { return 0 },
+    async ping() {},
+    async close() {},
+  })
+
+  const pgSchema = pgTools.find((t) => t.name === 'sql_schema')
+  try {
+    const res = await pgSchema.execute({
+      tables: ['orders', 'broken', 'sales.invoices'],
+      schema: 'analytics',
+    })
+    assert.deepEqual(seenRefs, ['"analytics"."orders"', '"analytics"."broken"', 'sales.invoices'])
+    assert.equal(res.tableDetails.length, 3)
+    assert.equal(res.tableDetails[0].schema, 'analytics')
+    assert.deepEqual(res.tableDetails[0].columns[1].enumValues, ['new', 'paid'])
+    assert.equal(res.tableDetails[1].table, 'broken')
+    assert.deepEqual(res.tableDetails[1].columns, [])
+    assert.match(res.tableDetails[1].error, /permission denied/)
+    assert.equal(res.tableDetails[2].schema, 'sales')
+    assert.equal(res.tableDetails[2].table, 'invoices')
+
+    const rendered = pgSchema.output.render({}, res)[0].text
+    assert.match(rendered, /### analytics\.orders/)
+    assert.match(rendered, /（枚举：new, paid）/)
+    assert.match(rendered, /### broken\n读取失败：permission denied/)
+    assert.match(rendered, /### sales\.invoices/)
+
+    // 批量模式遇到非法表名/schema 在调用适配器前即拒绝
+    const before = seenRefs.length
+    await assert.rejects(() => pgSchema.execute({ tables: ['orders', 'x;DROP TABLE y'] }), /表名 非法/)
+    await assert.rejects(() => pgSchema.execute({ tables: ['orders'], schema: 'a.b' }), /schema 非法/)
+    assert.equal(seenRefs.length, before)
+  } finally {
+    for (const a of pgAdapters.values()) await a.close()
   }
 })
 

@@ -166,6 +166,44 @@ test('SQLite：describeTableDetail 返回默认值、索引与外键，且支持
   }
 })
 
+test('SQLite：describeTableDetail 对不存在的表 0 列早退，仅执行 1 次 table_info', async () => {
+  const mem = createAdapter({ name: 'meta-missing', engine: 'sqlite', file: ':memory:' })
+  try {
+    const prepared = []
+    const origPrepare = mem.db.prepare.bind(mem.db)
+    mem.db.prepare = (sql) => {
+      prepared.push(sql)
+      return origPrepare(sql)
+    }
+
+    const missing = await mem.describeTableDetail('nonexistent_tbl')
+    assert.deepEqual(missing, {
+      table: 'nonexistent_tbl',
+      comment: null,
+      columns: [],
+      indexes: [],
+      foreignKeys: [],
+    })
+    assert.equal(prepared.length, 1)
+    assert.match(prepared[0], /PRAGMA table_info\("nonexistent_tbl"\)/)
+
+    prepared.length = 0
+    const missingWithSchema = await mem.describeTableDetail('main.nonexistent_tbl')
+    assert.deepEqual(missingWithSchema, {
+      table: 'nonexistent_tbl',
+      schema: 'main',
+      comment: null,
+      columns: [],
+      indexes: [],
+      foreignKeys: [],
+    })
+    assert.equal(prepared.length, 1)
+    assert.match(prepared[0], /PRAGMA "main"\.table_info\("nonexistent_tbl"\)/)
+  } finally {
+    await mem.close()
+  }
+})
+
 test('SQLite：query 与 exec 支持参数化查询（params）', async () => {
   const mem = createAdapter({ name: 'params', engine: 'sqlite', file: ':memory:' })
   try {

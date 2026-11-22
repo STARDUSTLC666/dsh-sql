@@ -8,6 +8,14 @@
  */
 /** 词法校验需要区分的三种引擎。 */
 export type SqlEngine = 'sqlite' | 'mysql' | 'postgres';
+/** 写操作高危风险类型。 */
+export type WriteRiskKind = 'drop' | 'truncate' | 'delete_without_where' | 'update_without_where';
+/** 单条写操作语句对应的高危风险提示。 */
+export interface WriteRiskWarning {
+    statementIndex: number;
+    kind: WriteRiskKind;
+    message: string;
+}
 /**
  * 去掉字符串、引号标识符与注释，保留真实 SQL 关键字与分号。
  * 被剥离的片段始终用空白占位，避免相邻 token 粘连。
@@ -27,9 +35,23 @@ export declare function splitSqlStatements(sql: string, engine?: SqlEngine): str
  */
 export declare function assertReadQuery(sql: string, engine?: SqlEngine): string;
 /**
+ * 判断一条只读查询是否适合走游标/子查询分页（`SELECT` / `WITH` / `VALUES` / `TABLE`）。
+ *
+ * 仅对单条只读结果集查询返回 `true`；对 `EXPLAIN` / `SHOW` / `DESCRIBE` / `DESC` / `PRAGMA`、
+ * 空串、多语句以及任何包含写关键字、`INTO` 或行锁子句的 SQL 均保守返回 `false`。
+ */
+export declare function isCursorEligibleQuery(sql: string, engine?: SqlEngine): boolean;
+/**
+ * 扫描写操作脚本中的高危语句：`DROP`、`TRUNCATE` 以及缺少顶层 `WHERE` 条件的 `DELETE` / `UPDATE`。
+ *
+ * 先按方言切分语句并剥离注释、字符串与引号标识符，再折叠顶层括号块，避免注释/字面量伪造
+ * 或 CTE/子查询内的 `WHERE` 掩盖外层全表删改。
+ */
+export declare function analyzeWriteRisks(sql: string, engine?: SqlEngine): WriteRiskWarning[];
+/**
  * 把一段写操作脚本压成审批卡可读的摘要。
  *
- * 关键点：按方言切分后逐条列出每条语句，并额外给一行语句类型统计。即使脚本体被省略，
- * 第二条、第 N 条语句的 DROP / DELETE 也不会从审批文本里消失。
+ * 关键点：按方言切分后逐条列出每条语句，并在开头高亮展示高危风险提示与语句类型统计。
+ * 即使脚本体被省略，第二条、第 N 条语句的 DROP / DELETE 也不会从审批文本里消失。
  */
 export declare function summarizeWriteScript(sql: string, engine?: SqlEngine): string;

@@ -125,13 +125,114 @@ test('审批卡包含目标连接与引擎，绝不泄露密码，并按目标�
   assert.match(myAsk.reason, /DROP×1/)
   assert.equal(myAsk.reason.includes(secret), false, '审批卡不得包含密码')
 
-  // 未知连接名不崩溃
-  const unknownAsk = await preExecute(
+  // 未知连接名在审批门快速拒绝，不浪费人工审批弹窗
+  const unknownDeny = await preExecute(
     { name: 'sql_exec', arguments: { connection: 'ghost', sql: 'DELETE FROM t' } },
     async () => ({ kind: 'allow' }),
   )
-  assert.equal(unknownAsk.kind, 'ask')
-  assert.ok(unknownAsk.reason.includes('ghost'))
+  assert.equal(unknownDeny.kind, 'deny')
+  assert.ok(unknownDeny.reason.includes('ghost'))
+  assert.match(unknownDeny.reason, /无需审批/)
+  assert.match(unknownDeny.reason, /sql_list/)
+})
+
+test('审批卡展示绑定参数（SQLite/MySQL 用 [1]=...，PG 用 $1=...）与高危提示，并安全处理长值/换行/大量参数', async () => {
+  const { ctx, listeners } = makeFakeCtx()
+  apply(ctx, {
+    connections: [
+      { name: 'local', engine: 'sqlite', file: ':memory:' },
+      { name: 'pg_prod', engine: 'postgres', host: 'db.internal', port: 5432, user: 'ops', database: 'billing' },
+      { name: 'my_prod', engine: 'mysql', host: 'my.internal', port: 3306, user: 'ops', database: 'shop' },
+    ],
+  })
+  const preExecute = listeners['tools/pre-execute'][0]
+
+  // SQLite 绑定参数展示 + 无 WHERE 高危提示
+  const sqliteAsk = await preExecute(
+    {
+      name: 'sql_exec',
+      arguments: {
+        connection: 'local',
+        sql: 'UPDATE orders SET status = ?, amount = ? WHERE id = ?',
+        params: ['paid', 42, 7],
+      },
+    },
+    async () => ({ kind: 'allow' }),
+  )
+  assert.equal(sqliteAsk.kind, 'ask')
+  const sqliteLines = sqliteAsk.reason.split('\n')
+  assert.equal(sqliteLines[1], '目标连接：local（sqlite @ :memory:）')
+  assert.equal(sqliteLines[2], '绑定参数（3 个）：[1]="paid", [2]=42, [3]=7')
+  assert.doesNotMatch(sqliteAsk.reason, /⚠️ 高危提示：/)
+
+  // MySQL 使用 [1]=...，并展示 DROP TABLE 高危提示
+  const mysqlAsk = await preExecute(
+    {
+      name: 'sql_exec',
+      arguments: {
+        connection: 'my_prod',
+        sql: 'DELETE FROM sessions; DROP TABLE legacy',
+        params: ['line1\nline2', null],
+      },
+    },
+    async () => ({ kind: 'allow' }),
+  )
+  assert.equal(mysqlAsk.kind, 'ask')
+  assert.ok(mysqlAsk.reason.includes('绑定参数（2 个）：[1]="line1\\nline2", [2]=null'))
+  assert.match(mysqlAsk.reason, /⚠️ 高危提示：/)
+  assert.match(mysqlAsk.reason, /无 WHERE 条件的 DELETE/)
+  assert.match(mysqlAsk.reason, /DROP TABLE/)
+
+  // PostgreSQL 使用 $1=...，并截断单值超过 120 字符与超过 50 个参数
+  const longVal = 'A'.repeat(200)
+  const manyParams = [longVal, 42, ...Array.from({ length: 53 }, (_, i) => i)]
+  const pgAsk = await preExecute(
+    {
+      name: 'sql_exec',
+      arguments: {
+        connection: 'pg_prod',
+        sql: 'DELETE FROM users',
+        params: manyParams,
+      },
+    },
+    async () => ({ kind: 'allow' }),
+  )
+  assert.equal(pgAsk.kind, 'ask')
+  const pgLines = pgAsk.reason.split('\n')
+  assert.equal(pgLines[1], '目标连接：pg_prod（postgres @ db.internal:5432/billing）')
+  assert.match(pgLines[2], /^绑定参数（55 个）：\$1="A{119}…, \$2=42,/)
+  assert.match(pgLines[2], /…另有 5 个参数$/)
+  assert.match(pgAsk.reason, /⚠️ 高危提示：/)
+  assert.match(pgAsk.reason, /无 WHERE 条件的 DELETE/)
+
+  // 非 JSON 安全值（BigInt / undefined / 循环引用 / null 原型对象 / 抛错 toString）均不崩溃
+  const cyclic = {}
+  cyclic.self = cyclic
+  const nullProtoBigInt = Object.assign(Object.create(null), { n: 1n })
+  const nullProtoCyclic = Object.create(null)
+  nullProtoCyclic.self = nullProtoCyclic
+  const throwingToString = { toString() { throw new Error('boom') } }
+  throwingToString.self = throwingToString
+  const nullProtoUndefJson = Object.assign(Object.create(null), { toJSON() { return undefined } })
+  const specialAsk = await preExecute(
+    {
+      name: 'sql_exec',
+      arguments: {
+        connection: 'pg_prod',
+        sql: 'UPDATE items SET a = $1, b = $2, c = $3 WHERE id = 1',
+        params: [12345678901234567890n, undefined, cyclic, nullProtoBigInt, nullProtoCyclic, throwingToString, nullProtoUndefJson],
+      },
+    },
+    async () => ({ kind: 'allow' }),
+  )
+  assert.equal(specialAsk.kind, 'ask')
+  assert.ok(specialAsk.reason.includes('$1=12345678901234567890'))
+  assert.ok(specialAsk.reason.includes('$2=undefined'))
+  assert.ok(specialAsk.reason.includes('$3=[object Object]'))
+  assert.ok(specialAsk.reason.includes('$4=[object Object]'))
+  assert.ok(specialAsk.reason.includes('$5=[object Object]'))
+  assert.ok(specialAsk.reason.includes('$6=[object Object]'))
+  assert.ok(specialAsk.reason.includes('$7=[object Object]'))
 })
 
 test('单连接 readOnly=true 在审批门与 sql_exec 执行期均拒绝写入，但不影响同配置的可写连接', async () => {

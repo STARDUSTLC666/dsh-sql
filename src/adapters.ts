@@ -9,7 +9,7 @@ import { DatabaseSync, type SQLInputValue } from 'node:sqlite'
 import type mysql from 'mysql2/promise'
 import type pg from 'pg'
 import { parseTableRef, type SqlConnectionConfig, type SqlSslOption } from './config.js'
-import { splitSqlStatements, stripSqlNoise } from './sql-lexer.js'
+import { isCursorEligibleQuery, splitSqlStatements, stripSqlNoise } from './sql-lexer.js'
 
 /** 查询结果：列名 + 行（值数组，无损 JSON 友好）。 */
 export interface QueryResult {
@@ -25,6 +25,7 @@ export interface ColumnInfo {
   primaryKey: boolean
   defaultValue?: string | null
   comment?: string | null
+  enumValues?: string[]
 }
 
 /** 索引元数据。 */
@@ -51,10 +52,11 @@ export interface TableSchemaDetail {
   foreignKeys: ForeignKeyInfo[]
 }
 
-/** 查询附加选项（参数绑定与服务端超时）。 */
+/** 查询附加选项（参数绑定、服务端超时与游标复用）。 */
 export interface QueryOptions {
   params?: unknown[]
   timeoutMs?: number
+  useCursor?: boolean
 }
 
 /** 写执行附加选项（参数绑定与超时）。 */
@@ -222,13 +224,13 @@ function resolveCaValue(ca: string): string {
   const trimmed = ca.trim()
   if (trimmed.includes('-----BEGIN')) return ca
   if (existsSync(trimmed)) return readFileSync(trimmed, 'utf8')
-  return ca
+  throw new Error('SSL CA 证书文件不存在：' + trimmed + '，请检查文件路径或直接提供 PEM 证书内容。')
 }
 
 function resolveSslConfig(ssl?: SqlSslOption): { rejectUnauthorized?: boolean; ca?: string } | undefined {
-  if (ssl === undefined || ssl === false || ssl === 'disable') return undefined
-  if (ssl === true || ssl === 'require') return { rejectUnauthorized: false }
-  if (ssl === 'verify-full') return { rejectUnauthorized: true }
+  if (ssl === undefined || ssl === false || ssl === 'disable' || ssl === 'allow') return undefined
+  if (ssl === true || ssl === 'prefer' || ssl === 'require') return { rejectUnauthorized: false }
+  if (ssl === 'verify-ca' || ssl === 'verify-full') return { rejectUnauthorized: true }
   const out: { rejectUnauthorized?: boolean; ca?: string } = {}
   if (ssl.rejectUnauthorized !== undefined) out.rejectUnauthorized = ssl.rejectUnauthorized
   if (ssl.ca !== undefined) out.ca = resolveCaValue(ssl.ca)
@@ -421,6 +423,16 @@ class SqliteAdapter implements DatabaseAdapter {
     const ref = parseTableRef(table, '表名')
     const schemaPrefix = ref.schema !== undefined ? quoteSqliteIdentifier(ref.schema) + '.' : ''
     const columns = await this.describeTable(table, signal)
+    if (columns.length === 0) {
+      return {
+        table: ref.table,
+        ...(ref.schema !== undefined ? { schema: ref.schema } : {}),
+        comment: null,
+        columns: [],
+        indexes: [],
+        foreignKeys: [],
+      }
+    }
     const indexRows = this.db.prepare('PRAGMA ' + schemaPrefix + 'index_list(' + quoteSqliteIdentifier(ref.table) + ')').all() as Array<Record<string, unknown>>
     const indexes: IndexInfo[] = []
     for (const idxRow of indexRows) {
@@ -574,6 +586,19 @@ class MysqlAdapter implements DatabaseAdapter {
       connection.destroy()
     }
     const onAbort = (): void => {
+      const threadId = (connection as { threadId?: unknown }).threadId
+        ?? (connection as { connection?: { threadId?: unknown } }).connection?.threadId
+      if (
+        typeof threadId === 'number'
+        && Number.isInteger(threadId)
+        && threadId > 0
+        && this.pool !== undefined
+        && typeof (this.pool as { query?: unknown }).query === 'function'
+      ) {
+        try {
+          void Promise.resolve(this.pool.query('KILL QUERY ?', [threadId])).catch(() => {})
+        } catch {}
+      }
       discard()
       rejectAbort(abortReason(signal!))
     }
@@ -645,7 +670,40 @@ class MysqlAdapter implements DatabaseAdapter {
     const ref = parseTableRef(table, '表名')
     const qualified = (ref.schema !== undefined ? quoteMysqlIdentifier(ref.schema) + '.' : '') + quoteMysqlIdentifier(ref.table)
     const columns = await this.describeTable(table, signal)
-    const [indexRows] = await this.queryRows('SHOW INDEX FROM ' + qualified, signal) as unknown as [Array<Record<string, unknown>>, unknown]
+    if (columns.length === 0) {
+      return {
+        table: ref.table,
+        ...(ref.schema !== undefined ? { schema: ref.schema } : {}),
+        comment: null,
+        columns: [],
+        indexes: [],
+        foreignKeys: [],
+      }
+    }
+    const schemaFilterSql = ref.schema !== undefined ? 'TABLE_SCHEMA = ?' : 'TABLE_SCHEMA = DATABASE()'
+    const metaParams = ref.schema !== undefined ? [ref.schema, ref.table] : [ref.table]
+    const [[indexRows], [fkRows], [tableRows]] = await Promise.all([
+      this.queryRows('SHOW INDEX FROM ' + qualified, signal) as Promise<[Array<Record<string, unknown>>, unknown]>,
+      this.queryRows(
+        {
+          sql: `SELECT COLUMN_NAME, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME
+                  FROM information_schema.KEY_COLUMN_USAGE
+                 WHERE ${schemaFilterSql}
+                   AND TABLE_NAME = ?
+                   AND REFERENCED_TABLE_NAME IS NOT NULL
+                 ORDER BY CONSTRAINT_NAME, ORDINAL_POSITION`,
+          values: metaParams,
+        },
+        signal,
+      ) as Promise<[Array<Record<string, unknown>>, unknown]>,
+      this.queryRows(
+        {
+          sql: `SELECT TABLE_COMMENT FROM information_schema.TABLES WHERE ${schemaFilterSql} AND TABLE_NAME = ? LIMIT 1`,
+          values: metaParams,
+        },
+        signal,
+      ) as Promise<[Array<Record<string, unknown>>, unknown]>,
+    ])
     const indexMap = new Map<string, { unique: boolean; cols: Array<{ seq: number; col: string }> }>()
     for (const row of indexRows) {
       const keyName = String(row.Key_name ?? '')
@@ -662,32 +720,11 @@ class MysqlAdapter implements DatabaseAdapter {
       unique: info.unique,
       columns: info.cols.sort((a, b) => a.seq - b.seq).map((item) => item.col),
     }))
-    const schemaFilterSql = ref.schema !== undefined ? 'TABLE_SCHEMA = ?' : 'TABLE_SCHEMA = DATABASE()'
-    const metaParams = ref.schema !== undefined ? [ref.schema, ref.table] : [ref.table]
-    const [fkRows] = await this.queryRows(
-      {
-        sql: `SELECT COLUMN_NAME, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME
-                FROM information_schema.KEY_COLUMN_USAGE
-               WHERE ${schemaFilterSql}
-                 AND TABLE_NAME = ?
-                 AND REFERENCED_TABLE_NAME IS NOT NULL
-               ORDER BY CONSTRAINT_NAME, ORDINAL_POSITION`,
-        values: metaParams,
-      },
-      signal,
-    ) as unknown as [Array<Record<string, unknown>>, unknown]
     const foreignKeys: ForeignKeyInfo[] = fkRows.map((row) => ({
       column: String(row.COLUMN_NAME ?? ''),
       refTable: String(row.REFERENCED_TABLE_NAME ?? ''),
       refColumn: String(row.REFERENCED_COLUMN_NAME ?? ''),
     }))
-    const [tableRows] = await this.queryRows(
-      {
-        sql: `SELECT TABLE_COMMENT FROM information_schema.TABLES WHERE ${schemaFilterSql} AND TABLE_NAME = ? LIMIT 1`,
-        values: metaParams,
-      },
-      signal,
-    ) as unknown as [Array<Record<string, unknown>>, unknown]
     const rawComment = tableRows?.[0]?.TABLE_COMMENT
     const comment = typeof rawComment === 'string' && rawComment !== '' ? rawComment : null
     return {
@@ -828,6 +865,18 @@ class PostgresAdapter implements DatabaseAdapter {
       client.release(true)
     }
     const onAbort = (): void => {
+      const pid = (client as { processID?: unknown }).processID
+      if (
+        typeof pid === 'number'
+        && Number.isInteger(pid)
+        && pid > 0
+        && this.pool !== undefined
+        && typeof (this.pool as { query?: unknown }).query === 'function'
+      ) {
+        try {
+          void Promise.resolve(this.pool.query('SELECT pg_cancel_backend($1)', [pid])).catch(() => {})
+        } catch {}
+      }
       discard()
       rejectAbort(abortReason(signal!))
     }
@@ -889,12 +938,24 @@ class PostgresAdapter implements DatabaseAdapter {
     const targetSchema = parseOptionalSchema(schema)
     const result = targetSchema !== undefined
       ? await this.queryWithSignal(
-        'SELECT table_schema, table_name FROM information_schema.tables WHERE table_schema = $1 ORDER BY table_name',
+        `SELECT n.nspname AS table_schema, c.relname AS table_name
+           FROM pg_catalog.pg_class c
+           JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+          WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f')
+            AND n.nspname = $1
+          ORDER BY n.nspname, c.relname`,
         [targetSchema],
         signal,
       )
       : await this.queryWithSignal(
-        "SELECT table_schema, table_name FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog', 'information_schema') ORDER BY table_schema, table_name",
+        `SELECT n.nspname AS table_schema, c.relname AS table_name
+           FROM pg_catalog.pg_class c
+           JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+          WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f')
+            AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+            AND n.nspname NOT LIKE 'pg_toast%'
+            AND n.nspname NOT LIKE 'pg_temp%'
+          ORDER BY n.nspname, c.relname`,
         undefined,
         signal,
       )
@@ -921,10 +982,25 @@ class PostgresAdapter implements DatabaseAdapter {
                    AND a.attnum = ANY(con.conkey)
               ) AS is_primary,
               pg_catalog.pg_get_expr(ad.adbin, ad.adrelid) AS default_value,
-              pg_catalog.col_description(c.oid, a.attnum) AS column_comment
+              pg_catalog.col_description(c.oid, a.attnum) AS column_comment,
+              CASE
+                WHEN t.typtype = 'e' THEN (
+                  SELECT array_agg(e.enumlabel::text ORDER BY e.enumsortorder)
+                    FROM pg_catalog.pg_enum e
+                   WHERE e.enumtypid = t.oid
+                )
+                WHEN et.typtype = 'e' THEN (
+                  SELECT array_agg(e.enumlabel::text ORDER BY e.enumsortorder)
+                    FROM pg_catalog.pg_enum e
+                   WHERE e.enumtypid = et.oid
+                )
+                ELSE NULL
+              END AS enum_values
          FROM pg_catalog.pg_class c
          JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
          JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid
+         JOIN pg_catalog.pg_type t ON t.oid = a.atttypid
+         LEFT JOIN pg_catalog.pg_type et ON et.oid = t.typelem AND t.typelem <> 0
          LEFT JOIN pg_catalog.pg_attrdef ad ON ad.adrelid = c.oid AND ad.adnum = a.attnum
         WHERE n.nspname = $1
           AND c.relname = $2
@@ -934,78 +1010,96 @@ class PostgresAdapter implements DatabaseAdapter {
       [schema, ref.table],
       signal,
     )
-    return result.rows.map((row: Record<string, unknown>) => ({
-      name: String(row.column_name),
-      type: String(row.data_type ?? ''),
-      notNull: row.not_null === true,
-      primaryKey: row.is_primary === true,
-      defaultValue: row.default_value === null || row.default_value === undefined ? null : String(row.default_value),
-      comment: typeof row.column_comment === 'string' && row.column_comment !== '' ? row.column_comment : null,
-    }))
+    return result.rows.map((row: Record<string, unknown>) => {
+      const col: ColumnInfo = {
+        name: String(row.column_name),
+        type: String(row.data_type ?? ''),
+        notNull: row.not_null === true,
+        primaryKey: row.is_primary === true,
+        defaultValue: row.default_value === null || row.default_value === undefined ? null : String(row.default_value),
+        comment: typeof row.column_comment === 'string' && row.column_comment !== '' ? row.column_comment : null,
+      }
+      if (Array.isArray(row.enum_values) && row.enum_values.length > 0) {
+        col.enumValues = row.enum_values.map(String)
+      }
+      return col
+    })
   }
   async describeTableDetail(table: string, signal?: AbortSignal): Promise<TableSchemaDetail> {
     const ref = parseTableRef(table, '表名')
     const schema = ref.schema ?? 'public'
     const columns = await this.describeTable(table, signal)
-    const commentRes = await this.queryWithSignal(
-      `SELECT pg_catalog.obj_description(c.oid, 'pg_class') AS table_comment
-         FROM pg_catalog.pg_class c
-         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-        WHERE n.nspname = $1
-          AND c.relname = $2
-        LIMIT 1`,
-      [schema, ref.table],
-      signal,
-    )
+    if (columns.length === 0) {
+      return {
+        table: ref.table,
+        schema,
+        comment: null,
+        columns: [],
+        indexes: [],
+        foreignKeys: [],
+      }
+    }
+    const [commentRes, indexRes, fkRes] = await Promise.all([
+      this.queryWithSignal(
+        `SELECT pg_catalog.obj_description(c.oid, 'pg_class') AS table_comment
+           FROM pg_catalog.pg_class c
+           JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+          WHERE n.nspname = $1
+            AND c.relname = $2
+          LIMIT 1`,
+        [schema, ref.table],
+        signal,
+      ),
+      this.queryWithSignal(
+        `SELECT i.relname AS index_name,
+                ix.indisunique AS is_unique,
+                COALESCE(
+                  ARRAY(
+                    SELECT COALESCE(a.attname, pg_catalog.pg_get_indexdef(ix.indexrelid, k.ord::integer, true))
+                      FROM unnest(ix.indkey::smallint[]) WITH ORDINALITY AS k(attnum, ord)
+                      LEFT JOIN pg_catalog.pg_attribute a
+                        ON a.attrelid = t.oid AND a.attnum = k.attnum AND k.attnum > 0
+                     ORDER BY k.ord
+                  ),
+                  ARRAY[]::text[]
+                ) AS index_columns
+           FROM pg_catalog.pg_class t
+           JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace
+           JOIN pg_catalog.pg_index ix ON ix.indrelid = t.oid
+           JOIN pg_catalog.pg_class i ON i.oid = ix.indexrelid
+          WHERE n.nspname = $1
+            AND t.relname = $2
+          ORDER BY i.relname`,
+        [schema, ref.table],
+        signal,
+      ),
+      this.queryWithSignal(
+        `SELECT a.attname AS column_name,
+                CASE WHEN fn.nspname = 'public' THEN fc.relname ELSE fn.nspname || '.' || fc.relname END AS ref_table,
+                fa.attname AS ref_column
+           FROM pg_catalog.pg_constraint con
+           JOIN pg_catalog.pg_class c ON c.oid = con.conrelid
+           JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+           JOIN pg_catalog.pg_class fc ON fc.oid = con.confrelid
+           JOIN pg_catalog.pg_namespace fn ON fn.oid = fc.relnamespace
+           JOIN unnest(con.conkey, con.confkey) WITH ORDINALITY AS cols(col_attnum, ref_attnum, ord) ON true
+           JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = cols.col_attnum
+           JOIN pg_catalog.pg_attribute fa ON fa.attrelid = fc.oid AND fa.attnum = cols.ref_attnum
+          WHERE n.nspname = $1
+            AND c.relname = $2
+            AND con.contype = 'f'
+          ORDER BY con.conname, cols.ord`,
+        [schema, ref.table],
+        signal,
+      ),
+    ])
     const rawComment = commentRes?.rows?.[0]?.table_comment
     const comment = typeof rawComment === 'string' && rawComment !== '' ? rawComment : null
-    const indexRes = await this.queryWithSignal(
-      `SELECT i.relname AS index_name,
-              ix.indisunique AS is_unique,
-              COALESCE(
-                ARRAY(
-                  SELECT COALESCE(a.attname, pg_catalog.pg_get_indexdef(ix.indexrelid, k.ord::integer, true))
-                    FROM unnest(ix.indkey::smallint[]) WITH ORDINALITY AS k(attnum, ord)
-                    LEFT JOIN pg_catalog.pg_attribute a
-                      ON a.attrelid = t.oid AND a.attnum = k.attnum AND k.attnum > 0
-                   ORDER BY k.ord
-                ),
-                ARRAY[]::text[]
-              ) AS index_columns
-         FROM pg_catalog.pg_class t
-         JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace
-         JOIN pg_catalog.pg_index ix ON ix.indrelid = t.oid
-         JOIN pg_catalog.pg_class i ON i.oid = ix.indexrelid
-        WHERE n.nspname = $1
-          AND t.relname = $2
-        ORDER BY i.relname`,
-      [schema, ref.table],
-      signal,
-    )
     const indexes: IndexInfo[] = (indexRes?.rows ?? []).map((row: Record<string, unknown>) => ({
       name: String(row.index_name ?? ''),
       unique: row.is_unique === true,
       columns: Array.isArray(row.index_columns) ? row.index_columns.map(String) : [],
     }))
-    const fkRes = await this.queryWithSignal(
-      `SELECT a.attname AS column_name,
-              CASE WHEN fn.nspname = 'public' THEN fc.relname ELSE fn.nspname || '.' || fc.relname END AS ref_table,
-              fa.attname AS ref_column
-         FROM pg_catalog.pg_constraint con
-         JOIN pg_catalog.pg_class c ON c.oid = con.conrelid
-         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-         JOIN pg_catalog.pg_class fc ON fc.oid = con.confrelid
-         JOIN pg_catalog.pg_namespace fn ON fn.oid = fc.relnamespace
-         JOIN unnest(con.conkey, con.confkey) WITH ORDINALITY AS cols(col_attnum, ref_attnum, ord) ON true
-         JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = cols.col_attnum
-         JOIN pg_catalog.pg_attribute fa ON fa.attrelid = fc.oid AND fa.attnum = cols.ref_attnum
-        WHERE n.nspname = $1
-          AND c.relname = $2
-          AND con.contype = 'f'
-        ORDER BY con.conname, cols.ord`,
-      [schema, ref.table],
-      signal,
-    )
     const foreignKeys: ForeignKeyInfo[] = (fkRes?.rows ?? []).map((row: Record<string, unknown>) => ({
       column: String(row.column_name ?? ''),
       refTable: String(row.ref_table ?? ''),
@@ -1033,6 +1127,33 @@ class PostgresAdapter implements DatabaseAdapter {
         const result = await client.query(queryConfig)
         return { columns: result.fields.map((field: { name: string }) => field.name), rows: result.rows.map((row: unknown[]) => row.map(toValue)) }
       }
+      if (
+        options?.useCursor === true
+        && Number.isFinite(limit)
+        && Math.round(limit) > 0
+        && (params === undefined || params.length === 0)
+        && isCursorEligibleQuery(sql, 'postgres')
+      ) {
+        const stmts = splitSqlStatements(sql.trim(), 'postgres')
+        if (stmts.length === 1 && stmts[0] !== '') {
+          // Extended protocol still rejects multiple commands with 42601;
+          // outer ROLLBACK closes the cursor and lets the pooled connection be reused cleanly.
+          await client.query({
+            text: 'DECLARE _dsh_cursor NO SCROLL CURSOR FOR ' + stmts[0],
+            queryMode: 'extended',
+          } as pg.QueryConfig)
+          signal?.throwIfAborted()
+          const fetched = await client.query({
+            text: 'FETCH ' + Math.round(limit) + ' FROM _dsh_cursor',
+            rowMode: 'array',
+            queryMode: 'extended',
+          } as pg.QueryArrayConfig)
+          return {
+            columns: fetched.fields.map((field: { name: string }) => field.name),
+            rows: fetched.rows.map((row: unknown[]) => row.map(toValue)),
+          }
+        }
+      }
       return await streamPostgresQuery(client, sql, limit, discard, isDiscarded, params)
     })
   }
@@ -1045,7 +1166,37 @@ class PostgresAdapter implements DatabaseAdapter {
     if (params !== undefined && params.length > 0 && stmts.length > 1) {
       throw new Error('带参数（params）的 sql_exec 仅支持单条语句。')
     }
-    const result = await this.queryWithSignal(sql, params !== undefined && params.length > 0 ? params : undefined, signal)
+    const values = params !== undefined && params.length > 0 ? params : undefined
+    const timeout = validTimeoutMs(options?.timeoutMs)
+    const result = timeout === undefined
+      ? await this.queryWithSignal(sql, values, signal)
+      : await this.withSignalClient(signal, async (client, discard, isDiscarded) => {
+        let timeoutApplied = false
+        let hasPrimaryError = false
+        try {
+          try {
+            await client.query('SET statement_timeout = ' + timeout)
+            timeoutApplied = true
+          } catch (error) {
+            discard()
+            throw error
+          }
+          signal?.throwIfAborted()
+          return values === undefined ? await client.query(sql) : await client.query(sql, values)
+        } catch (error) {
+          hasPrimaryError = true
+          throw error
+        } finally {
+          if (timeoutApplied && !isDiscarded()) {
+            try {
+              await client.query('RESET statement_timeout')
+            } catch (resetError) {
+              discard()
+              if (!hasPrimaryError) throw resetError
+            }
+          }
+        }
+      })
     if (Array.isArray(result)) {
       return result.reduce((acc, item) => acc + Number(item?.rowCount ?? 0), 0)
     }

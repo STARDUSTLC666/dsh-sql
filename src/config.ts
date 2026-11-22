@@ -1,5 +1,5 @@
 /**
- * dsh-sql 配置解析：多连接定义、行数上限、只读模式与写审批策略。
+ * dsh-sql 配置解析：多连接定义、行数上限、只读模式、写审批策略与敏感列脱敏。
  *
  * @module dsh-sql/config
  */
@@ -8,9 +8,28 @@
 export type SqlSslOption =
   | boolean
   | 'disable'
+  | 'allow'
+  | 'prefer'
   | 'require'
+  | 'verify-ca'
   | 'verify-full'
   | { rejectUnauthorized?: boolean; ca?: string }
+
+/** 开启 redactColumns: true 时使用的内置敏感列匹配模式（不区分大小写子串匹配）。 */
+export const DEFAULT_REDACT_COLUMN_PATTERNS: readonly string[] = Object.freeze([
+  'password',
+  'passwd',
+  'pwd',
+  'secret',
+  'token',
+  'api_key',
+  'apikey',
+  'access_key',
+  'private_key',
+  'credential',
+  'auth_key',
+  'session_key',
+])
 
 /** 单个数据库连接（行配置）。 */
 export interface SqlConnectionConfig {
@@ -41,6 +60,7 @@ export interface SqlConfig {
   writeApproval?: boolean
   queryTimeoutMs?: number
   execTimeoutMs?: number
+  redactColumns?: boolean | string[]
 }
 
 /** 解析后的配置。 */
@@ -51,13 +71,16 @@ export interface ResolvedSqlConfig {
   writeApproval: boolean
   queryTimeoutMs: number
   execTimeoutMs: number
+  redactColumns: string[]
   /** 未显式配置 connections 时为 true（自动回退到内置 :memory: SQLite）。 */
   implicitMemoryDefault?: boolean
 }
 
 const ENGINES = ['sqlite', 'mysql', 'postgres'] as const
-const SSL_MODES = ['disable', 'require', 'verify-full'] as const
+const SSL_MODES = ['disable', 'allow', 'prefer', 'require', 'verify-ca', 'verify-full'] as const
+const SSL_MODES_TEXT = SSL_MODES.join(' / ')
 type SqlSslMode = (typeof SSL_MODES)[number]
+const REDACT_REGEX_SYNTAX = /^\/(.*)\/([a-zA-Z]*)$/
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return false
@@ -74,7 +97,7 @@ function normalizeSslOption(rawSsl: unknown, name: string): SqlSslOption {
   if (typeof rawSsl === 'string') {
     const mode = rawSsl.trim().toLowerCase()
     if (isSslMode(mode)) return mode
-    throw new Error('连接 ' + name + ' 的 ssl 配置非法：字符串仅支持 disable / require / verify-full。')
+    throw new Error('连接 ' + name + ' 的 ssl 配置非法：字符串仅支持 ' + SSL_MODES_TEXT + '。')
   }
   if (isPlainObject(rawSsl)) {
     const out: { rejectUnauthorized?: boolean; ca?: string } = {}
@@ -97,7 +120,7 @@ function normalizeSslOption(rawSsl: unknown, name: string): SqlSslOption {
     }
     return out
   }
-  throw new Error('连接 ' + name + ' 的 ssl 配置非法：仅支持布尔值、disable / require / verify-full 或 { rejectUnauthorized, ca } 对象。')
+  throw new Error('连接 ' + name + ' 的 ssl 配置非法：仅支持布尔值、' + SSL_MODES_TEXT + ' 或 { rejectUnauthorized, ca } 对象。')
 }
 
 interface ParsedConnectionUrl {
@@ -129,14 +152,14 @@ function parseUrlSslParams(searchParams: URLSearchParams, name: string): SqlSslO
   if (sslModeValue !== undefined && sslModeValue.trim() !== '') {
     const normalized = sslModeValue.trim().toLowerCase()
     if (isSslMode(normalized)) return normalized
-    throw new Error('连接 ' + name + ' 的 url 中 sslmode 参数非法：仅支持 disable / require / verify-full。')
+    throw new Error('连接 ' + name + ' 的 url 中 sslmode 参数非法：仅支持 ' + SSL_MODES_TEXT + '。')
   }
   if (sslValue !== undefined && sslValue.trim() !== '') {
     const normalized = sslValue.trim().toLowerCase()
     if (normalized === 'true' || normalized === '1') return true
     if (normalized === 'false' || normalized === '0') return false
     if (isSslMode(normalized)) return normalized
-    throw new Error('连接 ' + name + ' 的 url 中 ssl 参数非法：仅支持 true / false / 1 / 0 或 disable / require / verify-full。')
+    throw new Error('连接 ' + name + ' 的 url 中 ssl 参数非法：仅支持 true / false / 1 / 0 或 ' + SSL_MODES_TEXT + '。')
   }
   return undefined
 }
@@ -232,6 +255,89 @@ function parseConnectionUrl(rawUrl: string, engine: SqlConnectionConfig['engine'
   return out
 }
 
+function compileRedactRegex(pattern: string): RegExp | undefined {
+  const match = REDACT_REGEX_SYNTAX.exec(pattern)
+  if (match === null) return undefined
+  const [, body, flags] = match
+  if (body === '') {
+    throw new Error('redactColumns 包含非法正则表达式：' + pattern + '（模式不能为空）。')
+  }
+  if (/[^iu]/.test(flags)) {
+    throw new Error('redactColumns 正则表达式标志非法（仅支持 i / u）：' + pattern + '。')
+  }
+  try {
+    return new RegExp(body, flags || 'i')
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error)
+    throw new Error('redactColumns 包含非法正则表达式：' + pattern + '（' + detail + '）。')
+  }
+}
+
+function resolveRedactColumns(raw: unknown): string[] {
+  if (raw === undefined || raw === false) return []
+  if (raw === true) return [...DEFAULT_REDACT_COLUMN_PATTERNS]
+  if (!Array.isArray(raw)) {
+    throw new Error('redactColumns 必须是布尔值或非空字符串数组。')
+  }
+  const resolved: string[] = []
+  const seen = new Set<string>()
+  for (const item of raw) {
+    if (typeof item !== 'string' || item.trim() === '') {
+      throw new Error('redactColumns 必须是布尔值或非空字符串数组。')
+    }
+    const trimmed = item.trim()
+    compileRedactRegex(trimmed)
+    if (!seen.has(trimmed)) {
+      seen.add(trimmed)
+      resolved.push(trimmed)
+    }
+  }
+  return resolved
+}
+
+/**
+ * 根据脱敏模式列表匹配结果列，返回命中的 0-based 列下标集合。
+ * 支持 `/pattern/`、`/pattern/flags`（允许 `i` / `u` 标志）正则以及不区分大小写的子串匹配。
+ */
+export function matchRedactedColumns(columns: readonly string[], patterns: readonly string[]): Set<number> {
+  const matched = new Set<number>()
+  if (patterns.length === 0 || columns.length === 0) return matched
+
+  const matchers: Array<{ regex: RegExp } | { needle: string }> = []
+  for (const raw of patterns) {
+    if (typeof raw !== 'string') continue
+    const trimmed = raw.trim()
+    if (trimmed === '') continue
+    const regex = compileRedactRegex(trimmed)
+    if (regex !== undefined) {
+      matchers.push({ regex })
+    } else {
+      matchers.push({ needle: trimmed.toLowerCase() })
+    }
+  }
+  if (matchers.length === 0) return matched
+
+  for (let i = 0; i < columns.length; i++) {
+    const col = columns[i]
+    let lowerCol: string | undefined
+    for (const matcher of matchers) {
+      if ('regex' in matcher) {
+        if (matcher.regex.test(col)) {
+          matched.add(i)
+          break
+        }
+      } else {
+        lowerCol ??= col.toLowerCase()
+        if (lowerCol.includes(matcher.needle)) {
+          matched.add(i)
+          break
+        }
+      }
+    }
+  }
+  return matched
+}
+
 /** 连接密码环境变量名：DSH_SQL_PASSWORD_<NAME 大写>。 */
 export function passwordEnvName(name: string): string {
   return 'DSH_SQL_PASSWORD_' + name.toUpperCase().replace(/[^A-Z0-9_]/g, '_')
@@ -316,7 +422,8 @@ export function resolveConfig(config: SqlConfig | undefined | null, env: NodeJS.
   }
   const readOnly = cfg.readOnly === true
   const writeApproval = cfg.writeApproval !== false
-  return { connections, maxRows, readOnly, writeApproval, queryTimeoutMs, execTimeoutMs, implicitMemoryDefault }
+  const redactColumns = resolveRedactColumns(cfg.redactColumns)
+  return { connections, maxRows, readOnly, writeApproval, queryTimeoutMs, execTimeoutMs, redactColumns, implicitMemoryDefault }
 }
 
 /** 校验表名/标识符，防注入到 schema 语句。 */

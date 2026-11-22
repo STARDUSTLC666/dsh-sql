@@ -121,3 +121,149 @@ test('MySQL describeTable / describeTableDetail via SHOW FULL COLUMNS / SHOW IND
     { column: 'tenant_id', refTable: 'tenants', refColumn: 'id' },
   ])
 })
+
+test('PostgreSQL describeTable returns enumValues for enum columns and omits it when null/empty', async () => {
+  const adapter = createAdapter({ name: 'pg-enum', engine: 'postgres', database: 'app' })
+  const seenSql = []
+  adapter.pool = {
+    async query(sql, values) {
+      seenSql.push({ sql, values })
+      return {
+        rows: [
+          {
+            column_name: 'id',
+            data_type: 'bigint',
+            not_null: true,
+            is_primary: true,
+            default_value: null,
+            column_comment: null,
+            enum_values: null,
+          },
+          {
+            column_name: 'status',
+            data_type: 'order_status',
+            not_null: true,
+            is_primary: false,
+            default_value: "'pending'::order_status",
+            column_comment: '订单状态',
+            enum_values: ['pending', 'paid', 'cancelled'],
+          },
+          {
+            column_name: 'empty_enum',
+            data_type: 'unused_enum',
+            not_null: false,
+            is_primary: false,
+            default_value: null,
+            column_comment: null,
+            enum_values: [],
+          },
+        ],
+      }
+    },
+  }
+
+  const columns = await adapter.describeTable('orders')
+  assert.match(seenSql[0].sql, /JOIN pg_catalog\.pg_type t ON t\.oid = a\.atttypid/)
+  assert.match(seenSql[0].sql, /pg_catalog\.pg_enum/)
+  assert.match(seenSql[0].sql, /enumlabel::text/)
+  assert.equal(Object.hasOwn(columns[0], 'enumValues'), false)
+  assert.deepEqual(columns[1].enumValues, ['pending', 'paid', 'cancelled'])
+  assert.equal(Object.hasOwn(columns[2], 'enumValues'), false)
+})
+
+test('PostgreSQL describeTableDetail：0 列早退仅查 1 次；有列时并发执行 3 条元数据查询', async () => {
+  // 1) 0 列早退
+  const missingAdapter = createAdapter({ name: 'pg-missing', engine: 'postgres', database: 'app' })
+  const missingSeen = []
+  missingAdapter.pool = {
+    async query(sql, values) {
+      missingSeen.push({ sql, values })
+      return { rows: [] }
+    },
+  }
+  const missingDetail = await missingAdapter.describeTableDetail('analytics.missing_tbl')
+  assert.deepEqual(missingDetail, {
+    table: 'missing_tbl',
+    schema: 'analytics',
+    comment: null,
+    columns: [],
+    indexes: [],
+    foreignKeys: [],
+  })
+  assert.equal(missingSeen.length, 1, 'missing PG table must stop after describeTable')
+
+  // 2) 并发执行验证：在任意一条详情查询 resolve 之前，3 条查询都必须同时进入 pool.query
+  const concurrentAdapter = createAdapter({ name: 'pg-concurrent', engine: 'postgres', database: 'app' })
+  const deferred = []
+  concurrentAdapter.pool = {
+    query(sql) {
+      if (sql.includes('pg_catalog.format_type')) {
+        return Promise.resolve({
+          rows: [{ column_name: 'id', data_type: 'integer', not_null: true, is_primary: true, default_value: null, column_comment: null }],
+        })
+      }
+      return new Promise((resolve) => {
+        deferred.push({ sql, resolve })
+      })
+    },
+  }
+  const pending = concurrentAdapter.describeTableDetail('users')
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(deferred.length, 3, 'comment, index and FK queries must run concurrently via Promise.all')
+  for (const item of deferred) {
+    if (item.sql.includes('obj_description')) item.resolve({ rows: [{ table_comment: '用户表' }] })
+    else if (item.sql.includes('pg_index')) item.resolve({ rows: [{ index_name: 'users_pkey', is_unique: true, index_columns: ['id'] }] })
+    else item.resolve({ rows: [] })
+  }
+  const detail = await pending
+  assert.equal(detail.comment, '用户表')
+  assert.equal(detail.indexes.length, 1)
+})
+
+test('MySQL describeTableDetail：0 列早退仅查 1 次；有列时并发执行 3 条元数据查询', async () => {
+  // 1) 0 列早退
+  const missingAdapter = createAdapter({ name: 'my-missing', engine: 'mysql', database: 'app' })
+  const missingSeen = []
+  missingAdapter.pool = {
+    async query(q) {
+      missingSeen.push(q)
+      return [[], []]
+    },
+  }
+  const missingDetail = await missingAdapter.describeTableDetail('shop.missing_tbl')
+  assert.deepEqual(missingDetail, {
+    table: 'missing_tbl',
+    schema: 'shop',
+    comment: null,
+    columns: [],
+    indexes: [],
+    foreignKeys: [],
+  })
+  assert.equal(missingSeen.length, 1, 'missing MySQL table must stop after SHOW FULL COLUMNS')
+
+  // 2) 并发执行验证：在任意一条详情查询 resolve 之前，3 条查询都必须同时进入 pool.query
+  const concurrentAdapter = createAdapter({ name: 'my-concurrent', engine: 'mysql', database: 'app' })
+  const deferred = []
+  concurrentAdapter.pool = {
+    query(q) {
+      const sql = typeof q === 'string' ? q : q.sql
+      if (sql.startsWith('SHOW FULL COLUMNS FROM ')) {
+        return Promise.resolve([[{ Field: 'id', Type: 'bigint', Null: 'NO', Key: 'PRI', Default: null, Comment: '' }], []])
+      }
+      return new Promise((resolve) => {
+        deferred.push({ sql, resolve })
+      })
+    },
+  }
+  const pending = concurrentAdapter.describeTableDetail('orders')
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(deferred.length, 3, 'SHOW INDEX, KEY_COLUMN_USAGE and TABLES queries must run concurrently via Promise.all')
+  for (const item of deferred) {
+    if (item.sql.startsWith('SHOW INDEX')) item.resolve([[{ Key_name: 'PRIMARY', Non_unique: 0, Seq_in_index: 1, Column_name: 'id' }], []])
+    else if (item.sql.includes('KEY_COLUMN_USAGE')) item.resolve([[], []])
+    else item.resolve([[{ TABLE_COMMENT: '订单表' }], []])
+  }
+  const detail = await pending
+  assert.equal(detail.comment, '订单表')
+  assert.equal(detail.indexes.length, 1)
+})

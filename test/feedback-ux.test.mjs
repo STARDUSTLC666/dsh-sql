@@ -65,13 +65,38 @@ test('sql_schema：表不存在时说清原因，不谎报「共 0 张表」', a
   assert.match(tables[0].text, /items/)
 })
 
-test('sql_exec：0 行受影响时提示核对条件', async () => {
+test('sql_exec：0 行受影响时提示核对条件，并在渲染中展示耗时 durationMs', async () => {
   const { tools, exec } = makeTools()
   await exec.execute({ sql: 'CREATE TABLE items (id INTEGER PRIMARY KEY)' })
   const value = await exec.execute({ sql: 'UPDATE items SET id = 1 WHERE id = 999' })
   assert.equal(value.changes, 0)
-  assert.match(exec.output.render({}, value)[0].text, /0 行/)
-  assert.match(exec.output.render({}, value)[0].text, /WHERE 条件/)
+  assert.equal(Number.isInteger(value.durationMs), true)
+  const rendered = exec.output.render({}, value)[0].text
+  assert.match(rendered, /0 行/)
+  assert.match(rendered, /耗时 \d+ms/)
+  assert.match(rendered, /WHERE 条件/)
+})
+
+test('sql_query：默认 Markdown 表格渲染清晰展示耗时与脱敏列提示', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-sql-ux-redact-'))
+  const cfg = resolveConfig({
+    connections: [{ name: 'local', engine: 'sqlite', file: join(dir, 'ux-r.db') }],
+    redactColumns: true,
+  })
+  const { tools, adapters } = buildSqlTools(cfg, () => 'ask')
+  cleanups.push(async () => {
+    for (const adapter of adapters.values()) await adapter.close()
+    rmSync(dir, { recursive: true, force: true })
+  })
+  const execTool = tools.find((t) => t.name === 'sql_exec')
+  const queryTool = tools.find((t) => t.name === 'sql_query')
+  await execTool.execute({ sql: 'CREATE TABLE creds (id INTEGER PRIMARY KEY, api_token TEXT)' })
+  await execTool.execute({ sql: "INSERT INTO creds (api_token) VALUES ('tok_live_secret')" })
+  const res = await queryTool.execute({ sql: 'SELECT id, api_token FROM creds' })
+  const text = queryTool.output.render({}, res)[0].text
+  assert.match(text, /查询返回 1 行，耗时 \d+ms（已脱敏列：api_token）/)
+  assert.match(text, /\| id \| api_token \|\n\| --- \| --- \|\n\| 1 \| \[REDACTED\] \|/)
+  assert.equal(text.includes('tok_live_secret'), false)
 })
 
 test('sql_list / sql_health：坏连接渲染给出下一步', async () => {

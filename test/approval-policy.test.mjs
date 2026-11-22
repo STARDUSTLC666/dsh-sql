@@ -82,6 +82,41 @@ test('单连接 readOnly=true 在审批门明确拒绝，同组可写连接正�
   }
 })
 
+test('readOnly=true（全局或单连接）即使 writeApproval=false 也在审批门一致拒绝，可写连接仍透传 next', async () => {
+  const globalRo = host('never', { readOnly: true, writeApproval: false })
+  const mixed = host('never', {
+    writeApproval: false,
+    connections: [
+      { name: 'ro_db', engine: 'sqlite', file: ':memory:', readOnly: true },
+      { name: 'rw_db', engine: 'sqlite', file: ':memory:' },
+    ],
+  })
+  try {
+    const globalDenied = await globalRo.gate(
+      { name: 'sql_exec', arguments: { sql: 'DELETE FROM items' } },
+      async () => ({ kind: 'allow' }),
+    )
+    assert.equal(globalDenied.kind, 'deny')
+    assert.match(globalDenied.reason, /readOnly=true/)
+
+    const connDenied = await mixed.gate(
+      { name: 'sql_exec', arguments: { connection: 'ro_db', sql: 'DELETE FROM items' } },
+      async () => ({ kind: 'allow' }),
+    )
+    assert.equal(connDenied.kind, 'deny')
+    assert.match(connDenied.reason, /ro_db/)
+
+    const rwPass = await mixed.gate(
+      { name: 'sql_exec', arguments: { connection: 'rw_db', sql: 'DELETE FROM items' } },
+      async () => ({ kind: 'allow' }),
+    )
+    assert.deepEqual(rwPass, { kind: 'allow' })
+  } finally {
+    globalRo.dispose()
+    mixed.dispose()
+  }
+})
+
 test('SQL 连接可用但审批不可用时，健康检查不误报全部功能正常', async () => {
   const { tools, adapters } = buildSqlTools(resolveConfig({}), () => 'never')
   try {
@@ -91,4 +126,56 @@ test('SQL 连接可用但审批不可用时，健康检查不误报全部功能�
     assert.equal(health.writeApprovalReady, false)
     assert.match(health.writeApprovalDetail, /never.*writeApproval=false/)
   } finally { for (const adapter of adapters.values()) await adapter.close() }
+})
+
+test('sql_health：全部连接均为单连接 readOnly=true 且全局 readOnly=false 时，never 策略下仍报告 ok=true', async () => {
+  const cfg = resolveConfig({
+    readOnly: false,
+    writeApproval: true,
+    connections: [
+      { name: 'ro_a', engine: 'sqlite', file: ':memory:', readOnly: true },
+      { name: 'ro_b', engine: 'sqlite', file: ':memory:', readOnly: true },
+    ],
+  })
+  const { tools, adapters } = buildSqlTools(cfg, () => 'never')
+  try {
+    const healthTool = tools.find(t => t.name === 'sql_health')
+    const health = await healthTool.execute({}, {})
+    assert.equal(health.ok, true)
+    assert.equal(health.readOnly, false)
+    assert.equal(health.writeApprovalReady, true)
+    assert.equal(health.writeApprovalDetail, '全部连接均为只读配置，不允许写入')
+    const rendered = healthTool.output.render({}, health)[0].text
+    assert.match(rendered, /自检：正常/)
+    assert.match(rendered, /全部连接均为只读配置，不允许写入/)
+    assert.match(rendered, /全部连接均配置了只读模式/)
+    assert.doesNotMatch(rendered, /写审批门当前无法确认/)
+  } finally {
+    for (const adapter of adapters.values()) await adapter.close()
+  }
+})
+
+test('sql_health：全局 readOnly=true 与部分连接只读（混合可写）区分正确', async () => {
+  const globalRo = buildSqlTools(resolveConfig({ readOnly: true }), () => 'never')
+  const mixed = buildSqlTools(resolveConfig({
+    readOnly: false,
+    connections: [
+      { name: 'ro_a', engine: 'sqlite', file: ':memory:', readOnly: true },
+      { name: 'rw_b', engine: 'sqlite', file: ':memory:' },
+    ],
+  }), () => 'never')
+  try {
+    const roHealth = await globalRo.tools.find(t => t.name === 'sql_health').execute({}, {})
+    assert.equal(roHealth.ok, true)
+    assert.equal(roHealth.writeApprovalReady, true)
+    assert.equal(roHealth.writeApprovalDetail, '全局只读配置，不允许写入')
+
+    const mixedHealth = await mixed.tools.find(t => t.name === 'sql_health').execute({}, {})
+    assert.equal(mixedHealth.ok, false)
+    assert.equal(mixedHealth.writeApprovalReady, false)
+    assert.match(mixedHealth.writeApprovalDetail, /never.*writeApproval=false/)
+  } finally {
+    for (const adapter of globalRo.adapters.values()) await adapter.close()
+    for (const adapter of mixed.adapters.values()) await adapter.close()
+  }
 })

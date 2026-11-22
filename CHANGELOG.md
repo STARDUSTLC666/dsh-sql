@@ -1,5 +1,13 @@
 # 更新记录
 
+## 0.8.0 (2026-11-22)
+
+- 写审批卡全面强化：`sql_exec` 审批卡现在完整展示参数化绑定值 `params`（PostgreSQL `$1=...` / SQLite & MySQL `[1]=...`），并由 `analyzeWriteRisks` 自动识别高危语句（`DROP`、`TRUNCATE`、无顶层 `WHERE` 的 `DELETE`/`UPDATE`，穿透 CTE 与子查询）在顶部标出 `⚠️ 高危提示`；未知连接名在审批前直接拒绝，只读配置下即使关闭 `writeApproval` 也于门控层一致拒绝。
+- 敏感列脱敏（`redactColumns`）：新增热更新配置项，支持 `false`（默认关闭）、`true`（启用 12 条内置密码/密钥/Token 规则）或自定义列名子串与 `/regex/` 正则数组，在 `rows` / `table` / `markdown` / `csv` / `json` 输出前将非空敏感值统一替换为 `[REDACTED]`（保留 `NULL`），并在结果与 `sql_health` 中明示脱敏状态。
+- 查询与结构探查升级：`sql_query` 新增 `format: "markdown"`，默认 `table` 改为标准 GFM Markdown 表格；`sql_query` 与 `sql_exec` 返回并展示执行耗时 `durationMs`；`sql_schema` 支持 `tables` 批量并发查最多 20 张表结构（单表错误隔离），`describeTableDetail` 在 0 列时立即早退并将 MySQL/PostgreSQL 元数据查询改为并发；PostgreSQL 表清单新增物化视图并从 `pg_enum` 提取列枚举值 `enumValues`。
+- 云库连接与服务端治理：扩展 `ssl` 与连接串 `?sslmode=` 支持 `disable` / `allow` / `prefer` / `require` / `verify-ca` / `verify-full` 并校验缺失的 `ssl.ca` 文件路径；`PostgresAdapter.exec()` 补齐 `SET/RESET statement_timeout` 服务端超时；取消查询时向 PostgreSQL（`pg_cancel_backend`）与 MySQL（`KILL QUERY`）发送尽力而为的服务端中止；PostgreSQL 无参数有界只读查询使用扩展协议 `NO SCROLL CURSOR` 复用连接池；`sql_health` 正确识别全连接单连接只读场景。
+- Major safety & UX release: display bound `params`, high-risk warnings (`DROP`/`TRUNCATE`/unfiltered `DELETE`/`UPDATE` across CTEs/subqueries), and fast-deny for unknown connections in the `sql_exec` approval card; add live-reloadable `redactColumns` sensitive-column masking (`[REDACTED]` across all formats); add `format: "markdown"`, GFM Markdown default tables, `durationMs` timing, concurrent batch `sql_schema` (`tables`), PG materialized views & `enumValues`, parallel `describeTableDetail` with 0-column early exit, full 6-mode cloud `sslmode` + CA path validation, PG `exec()` `statement_timeout`, best-effort server-side cancellation (`pg_cancel_backend` / `KILL QUERY`), PG `NO SCROLL CURSOR` pool reuse, and all-connections-readOnly `sql_health` detection.
+
 ## 0.7.1 (2026-11-22)
 
 - 修复 Node 22 下 `AbortSignal.timeout()` 定时器未保活事件循环导致超时探活提前退出的兼容问题，改用可及时清理的 `createTimeoutScope` 并在操作结束立即释放定时器。

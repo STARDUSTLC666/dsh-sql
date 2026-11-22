@@ -1,13 +1,15 @@
 /**
- * dsh-sql 配置解析：多连接定义、行数上限、只读模式与写审批策略。
+ * dsh-sql 配置解析：多连接定义、行数上限、只读模式、写审批策略与敏感列脱敏。
  *
  * @module dsh-sql/config
  */
 /** 数据库连接 TLS/SSL 选项。 */
-export type SqlSslOption = boolean | 'disable' | 'require' | 'verify-full' | {
+export type SqlSslOption = boolean | 'disable' | 'allow' | 'prefer' | 'require' | 'verify-ca' | 'verify-full' | {
     rejectUnauthorized?: boolean;
     ca?: string;
 };
+/** 开启 redactColumns: true 时使用的内置敏感列匹配模式（不区分大小写子串匹配）。 */
+export declare const DEFAULT_REDACT_COLUMN_PATTERNS: readonly string[];
 /** 单个数据库连接（行配置）。 */
 export interface SqlConnectionConfig {
     name: string;
@@ -35,6 +37,7 @@ export interface SqlConfig {
     writeApproval?: boolean;
     queryTimeoutMs?: number;
     execTimeoutMs?: number;
+    redactColumns?: boolean | string[];
 }
 /** 解析后的配置。 */
 export interface ResolvedSqlConfig {
@@ -44,9 +47,15 @@ export interface ResolvedSqlConfig {
     writeApproval: boolean;
     queryTimeoutMs: number;
     execTimeoutMs: number;
+    redactColumns: string[];
     /** 未显式配置 connections 时为 true（自动回退到内置 :memory: SQLite）。 */
     implicitMemoryDefault?: boolean;
 }
+/**
+ * 根据脱敏模式列表匹配结果列，返回命中的 0-based 列下标集合。
+ * 支持 `/pattern/`、`/pattern/flags`（允许 `i` / `u` 标志）正则以及不区分大小写的子串匹配。
+ */
+export declare function matchRedactedColumns(columns: readonly string[], patterns: readonly string[]): Set<number>;
 /** 连接密码环境变量名：DSH_SQL_PASSWORD_<NAME 大写>。 */
 export declare function passwordEnvName(name: string): string;
 /**

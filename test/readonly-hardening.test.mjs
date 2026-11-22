@@ -12,6 +12,10 @@ import {
   resolveConfig,
   summarizeWriteScript,
 } from '../lib/index.js'
+import {
+  analyzeWriteRisks,
+  isCursorEligibleQuery,
+} from '../lib/sql-lexer.js'
 
 const dir = mkdtempSync(join(tmpdir(), 'dsh-sql-ro-'))
 const file = join(dir, 'app.db')
@@ -203,6 +207,55 @@ test('词法回归：PostgreSQL 嵌套块注释、数组方括号与合法只读
   assert.doesNotThrow(() => assertReadQuery('DESC ANALYZE SELECT 1', 'mysql'))
   assert.throws(() => assertReadQuery('DESCRIBE DELETE FROM users', 'mysql'), /DELETE/)
   assert.throws(() => assertReadQuery('DESC ANALYZE DELETE FROM users', 'mysql'), /DELETE/)
+})
+
+test('高危写操作审计：审批卡突出显示 DROP / TRUNCATE 与无 WHERE 删改，安全写操作不误报', async () => {
+  const { ctx, listeners } = makeFakeCtx()
+  ctx.get = name => name === 'approval' ? { config: { policy: 'ask' } } : undefined
+  apply(ctx, { writeApproval: true })
+
+  const riskySql = [
+    'WITH dead AS (SELECT id FROM t WHERE x = 1) DELETE FROM users;',
+    'UPDATE users SET score = (SELECT max(s) FROM scores WHERE ok = 1);',
+    'DELETE FROM audit_logs -- WHERE id = 1',
+    '; TRUNCATE TABLE sessions;',
+    'DROP DATABASE legacy_db',
+  ].join('\n')
+  const riskyDecision = await listeners['tools/pre-execute'][0](
+    { name: 'sql_exec', arguments: { sql: riskySql } },
+    async () => ({ kind: 'allow' }),
+  )
+  assert.equal(riskyDecision.kind, 'ask')
+  assert.match(riskyDecision.reason, /⚠️ 高危提示：/)
+  assert.match(riskyDecision.reason, /第 1 条语句为无 WHERE 条件的 DELETE/)
+  assert.match(riskyDecision.reason, /第 2 条语句为无 WHERE 条件的 UPDATE/)
+  assert.match(riskyDecision.reason, /第 3 条语句为无 WHERE 条件的 DELETE/)
+  assert.match(riskyDecision.reason, /第 4 条语句.*将清空整张表/)
+  assert.match(riskyDecision.reason, /第 5 条语句.*DROP DATABASE/)
+
+  const safeSql = "INSERT INTO logs VALUES ('DROP TABLE users; DELETE FROM t'); UPDATE users SET active = 1 WHERE id = 1"
+  assert.deepEqual(analyzeWriteRisks(safeSql), [])
+  const safeDecision = await listeners['tools/pre-execute'][0](
+    { name: 'sql_exec', arguments: { sql: safeSql } },
+    async () => ({ kind: 'allow' }),
+  )
+  assert.equal(safeDecision.kind, 'ask')
+  assert.doesNotMatch(safeDecision.reason, /⚠️ 高危提示：/)
+})
+
+test('游标资格校验 fail-closed：仅放行单条只读结果集查询', () => {
+  assert.equal(isCursorEligibleQuery('SELECT * FROM users'), true)
+  assert.equal(isCursorEligibleQuery('WITH c AS (SELECT 1) SELECT * FROM c'), true)
+  assert.equal(isCursorEligibleQuery('(SELECT 1) UNION (SELECT 2)'), true)
+  assert.equal(isCursorEligibleQuery('VALUES (1)'), true)
+  assert.equal(isCursorEligibleQuery('EXPLAIN SELECT 1'), false)
+  assert.equal(isCursorEligibleQuery('SHOW TABLES', 'mysql'), false)
+  assert.equal(isCursorEligibleQuery('DESCRIBE users', 'mysql'), false)
+  assert.equal(isCursorEligibleQuery('PRAGMA table_info(t)', 'sqlite'), false)
+  assert.equal(isCursorEligibleQuery('SELECT 1; DELETE FROM users'), false)
+  assert.equal(isCursorEligibleQuery("SELECT * FROM users INTO OUTFILE '/tmp/x'", 'mysql'), false)
+  assert.equal(isCursorEligibleQuery('SELECT * FROM users FOR UPDATE', 'postgres'), false)
+  assert.equal(isCursorEligibleQuery('WITH d AS (DELETE FROM users RETURNING *) SELECT * FROM d', 'postgres'), false)
 })
 
 function makeFakeCtx() {

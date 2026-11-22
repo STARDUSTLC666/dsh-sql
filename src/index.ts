@@ -46,6 +46,9 @@ export interface SqlPluginContext extends ApprovalContext {
   on(event: 'dispose', listener: () => void): () => void
 }
 
+const MAX_APPROVAL_PARAMS = 50
+const MAX_APPROVAL_PARAM_VALUE_CHARS = 120
+
 /** 格式化审批卡的目标连接描述（绝不包含密码）。 */
 function formatApprovalTarget(connection: SqlConnectionConfig | undefined, requestedName: string | undefined): string {
   if (connection === undefined) {
@@ -57,6 +60,46 @@ function formatApprovalTarget(connection: SqlConnectionConfig | undefined, reque
     ? (connection.file ?? ':memory:')
     : `${connection.host ?? 'localhost'}:${connection.port ?? (connection.engine === 'postgres' ? 5432 : 3306)}/${connection.database ?? ''}`
   return `目标连接：${connection.name}（${connection.engine} @ ${targetDesc}）`
+}
+
+function safeToString(value: unknown): string {
+  try {
+    return String(value)
+  } catch {
+    return Object.prototype.toString.call(value)
+  }
+}
+
+/** 安全格式化单个绑定参数值：折叠换行并限制单值长度，确保审批人可见真实写入值。 */
+function formatApprovalParamValue(value: unknown): string {
+  let text: string
+  if (value === undefined) {
+    text = 'undefined'
+  } else if (typeof value === 'number' && !Number.isFinite(value)) {
+    text = String(value)
+  } else {
+    try {
+      const json = JSON.stringify(value)
+      text = json !== undefined ? json : safeToString(value)
+    } catch {
+      text = safeToString(value)
+    }
+  }
+  text = text.replace(/\r\n|\r|\n/g, '\\n')
+  return text.length > MAX_APPROVAL_PARAM_VALUE_CHARS
+    ? text.slice(0, MAX_APPROVAL_PARAM_VALUE_CHARS) + '…'
+    : text
+}
+
+/** 格式化审批卡的绑定参数清单（PostgreSQL 用 $1=...，SQLite/MySQL 用 [1]=...）。 */
+function formatApprovalParams(params: readonly unknown[], engine: SqlConnectionConfig['engine'] | undefined): string {
+  const count = Math.min(params.length, MAX_APPROVAL_PARAMS)
+  const prefix = (index: number): string => (engine === 'postgres' ? '$' + (index + 1) : '[' + (index + 1) + ']')
+  const shown = Array.from({ length: count }, (_, index) => prefix(index) + '=' + formatApprovalParamValue(params[index]))
+  const suffix = params.length > MAX_APPROVAL_PARAMS
+    ? ' …另有 ' + (params.length - MAX_APPROVAL_PARAMS) + ' 个参数'
+    : ''
+  return '绑定参数（' + params.length + ' 个）：' + shown.join(', ') + suffix
 }
 
 /**
@@ -78,9 +121,6 @@ export function apply(ctx: SqlPluginContext, config?: SqlConfig | null): void {
   const offPreExecute = ctx.on('tools/pre-execute', async (exec, next) => {
     if (exec.name !== 'sql_exec') return next()
     const currentCfg = getCfg()
-    if (!currentCfg.writeApproval) return next()
-    const downstream = await next()
-    if (downstream.kind === 'deny') return downstream
     const args = (typeof exec.arguments === 'object' && exec.arguments !== null ? exec.arguments : {}) as Record<string, unknown>
     const requestedName = typeof args.connection === 'string' && args.connection.trim() !== ''
       ? args.connection.trim()
@@ -100,15 +140,29 @@ export function apply(ctx: SqlPluginContext, config?: SqlConfig | null): void {
         reason: `目标连接 ${targetConn.name} 为只读配置（readOnly=true），sql_exec 已禁用 / Connection "${targetConn.name}" is read-only; sql_exec is disabled.`,
       }
     }
+    if (!currentCfg.writeApproval) return next()
+    const downstream = await next()
+    if (downstream.kind === 'deny') return downstream
+    if (requestedName !== undefined && targetConn === undefined) {
+      return {
+        kind: 'deny',
+        reason: '未找到名为 ' + requestedName + ' 的数据库连接，无需审批。请先调用 sql_list 查看现有连接名。',
+      }
+    }
     const problem = approvalProblem(policyOf(exec), 'writeApproval')
     if (problem) return { kind: 'deny', reason: problem }
     const sql = typeof args.sql === 'string' ? args.sql : ''
     const targetLine = formatApprovalTarget(targetConn, requestedName)
+    const lines = ['sql_exec 写操作需要确认：', targetLine]
+    if (Array.isArray(args.params) && args.params.length > 0) {
+      lines.push(formatApprovalParams(args.params, targetConn?.engine))
+    }
+    lines.push(summarizeWriteScript(sql, targetConn?.engine))
     return {
       kind: 'ask',
-      // 不截断整段 SQL：先标明目标连接，再按目标引擎词法逐条列出每条语句与语句类型统计，最后附完整 SQL。
+      // 不截断整段 SQL：先标明目标连接与绑定参数，再按目标引擎词法逐条列出高危提示、每条语句与语句类型统计，最后附完整 SQL。
       // 只截 200 字符会把第二条 DROP / DELETE 挡在审批卡之外。
-      reason: 'sql_exec 写操作需要确认：\n' + targetLine + '\n' + summarizeWriteScript(sql, targetConn?.engine),
+      reason: lines.join('\n'),
     }
   })
   if (typeof offPreExecute === 'function') disposers.push(offPreExecute)

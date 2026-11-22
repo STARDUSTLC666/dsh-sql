@@ -14,6 +14,7 @@ export interface ColumnInfo {
     primaryKey: boolean;
     defaultValue?: string | null;
     comment?: string | null;
+    enumValues?: string[];
 }
 /** 索引元数据。 */
 export interface IndexInfo {
@@ -36,10 +37,11 @@ export interface TableSchemaDetail {
     indexes: IndexInfo[];
     foreignKeys: ForeignKeyInfo[];
 }
-/** 查询附加选项（参数绑定与服务端超时）。 */
+/** 查询附加选项（参数绑定、服务端超时与游标复用）。 */
 export interface QueryOptions {
     params?: unknown[];
     timeoutMs?: number;
+    useCursor?: boolean;
 }
 /** 写执行附加选项（参数绑定与超时）。 */
 export interface ExecOptions {

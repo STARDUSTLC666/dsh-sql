@@ -1,6 +1,17 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { apply, Config, HostValidationError, liveConfig, resolveConfig, assertIdentifier, parseTableRef, passwordEnvName } from '../lib/index.js'
+import {
+  apply,
+  Config,
+  DEFAULT_REDACT_COLUMN_PATTERNS,
+  HostValidationError,
+  liveConfig,
+  matchRedactedColumns,
+  resolveConfig,
+  assertIdentifier,
+  parseTableRef,
+  passwordEnvName,
+} from '../lib/index.js'
 import { z } from '../lib/host-config.js'
 
 test('默认：内存 SQLite 兜底连接', () => {
@@ -11,6 +22,7 @@ test('默认：内存 SQLite 兜底连接', () => {
   assert.equal(cfg.connections[0].file, ':memory:')
   assert.equal(cfg.maxRows, 1000)
   assert.equal(cfg.writeApproval, true)
+  assert.deepEqual(cfg.redactColumns, [])
 })
 
 test('多连接解析 + 密码环境变量回退', () => {
@@ -138,7 +150,10 @@ test('连接 ssl 选项支持多种形式并校验非法值', () => {
       { name: 'bool_on', engine: 'postgres', database: 'app', ssl: true },
       { name: 'bool_off', engine: 'mysql', database: 'app', ssl: false },
       { name: 'mode_disable', engine: 'postgres', database: 'app', ssl: 'disable' },
+      { name: 'mode_allow', engine: 'postgres', database: 'app', ssl: 'allow' },
+      { name: 'mode_prefer', engine: 'postgres', database: 'app', ssl: ' PREFER ' },
       { name: 'mode_require', engine: 'postgres', database: 'app', ssl: ' REQUIRE ' },
+      { name: 'mode_verify_ca', engine: 'postgres', database: 'app', ssl: 'verify-ca' },
       { name: 'mode_verify', engine: 'postgres', database: 'app', ssl: 'verify-full' },
       { name: 'obj', engine: 'postgres', database: 'app', ssl: sslObj },
       { name: 'empty_obj', engine: 'mysql', database: 'app', ssl: {} },
@@ -148,18 +163,25 @@ test('连接 ssl 选项支持多种形式并校验非法值', () => {
   assert.equal(cfg.connections[1].ssl, true)
   assert.equal(cfg.connections[2].ssl, false)
   assert.equal(cfg.connections[3].ssl, 'disable')
-  assert.equal(cfg.connections[4].ssl, 'require')
-  assert.equal(cfg.connections[5].ssl, 'verify-full')
-  assert.deepEqual(cfg.connections[6].ssl, sslObj)
-  assert.notEqual(cfg.connections[6].ssl, sslObj)
-  assert.deepEqual(cfg.connections[7].ssl, {})
+  assert.equal(cfg.connections[4].ssl, 'allow')
+  assert.equal(cfg.connections[5].ssl, 'prefer')
+  assert.equal(cfg.connections[6].ssl, 'require')
+  assert.equal(cfg.connections[7].ssl, 'verify-ca')
+  assert.equal(cfg.connections[8].ssl, 'verify-full')
+  assert.deepEqual(cfg.connections[9].ssl, sslObj)
+  assert.notEqual(cfg.connections[9].ssl, sslObj)
+  assert.deepEqual(cfg.connections[10].ssl, {})
 
-  for (const badSsl of ['prefer', '', 123, null, ['require'], { rejectUnauthorized: 'no' }, { ca: '' }, { ca: 42 }, { unknownKey: true }]) {
+  for (const badSsl of ['bogus', '', 123, null, ['require'], { rejectUnauthorized: 'no' }, { ca: '' }, { ca: 42 }, { unknownKey: true }]) {
     assert.throws(
       () => resolveConfig({ connections: [{ name: 'bad', engine: 'postgres', database: 'app', ssl: badSsl }] }),
       /ssl/,
     )
   }
+  assert.throws(
+    () => resolveConfig({ connections: [{ name: 'bad', engine: 'postgres', database: 'app', ssl: 'bogus' }] }),
+    /disable \/ allow \/ prefer \/ require \/ verify-ca \/ verify-full/,
+  )
 })
 
 test('连接 url 解析（PostgreSQL / MySQL / SQLite）、显式字段优先级与密码回退顺序', () => {
@@ -381,6 +403,10 @@ test('host-config：number 拒绝 Infinity/-Infinity/NaN，toJSON 异常后清�
   assert.equal(Config.dict.writeApproval.meta.default, true)
   assert.equal(Config.dict.queryTimeoutMs.meta.default, 60000)
   assert.equal(Config.dict.execTimeoutMs.meta.default, 120000)
+  assert.equal(Config.dict.redactColumns.meta.default, false)
+  assert.equal(Config.dict.redactColumns.meta.volatile, true)
+  assert.equal(typeof Config.dict.redactColumns.meta.description.zh, 'string')
+  assert.equal(typeof Config.dict.redactColumns.meta.description.en, 'string')
 
   const defaultsParsed = Config({})
   assert.deepEqual(defaultsParsed.connections.get(), [])
@@ -389,6 +415,7 @@ test('host-config：number 拒绝 Infinity/-Infinity/NaN，toJSON 异常后清�
   assert.equal(defaultsParsed.writeApproval.get(), true)
   assert.equal(defaultsParsed.queryTimeoutMs.get(), 60000)
   assert.equal(defaultsParsed.execTimeoutMs.get(), 120000)
+  assert.equal(defaultsParsed.redactColumns.get(), false)
   assert.equal(Config.simplify(defaultsParsed), null)
 
   const resolvedDefaults = resolveConfig(liveConfig(defaultsParsed))
@@ -398,6 +425,7 @@ test('host-config：number 拒绝 Infinity/-Infinity/NaN，toJSON 异常后清�
   assert.equal(resolvedDefaults.writeApproval, true)
   assert.equal(resolvedDefaults.queryTimeoutMs, 60000)
   assert.equal(resolvedDefaults.execTimeoutMs, 120000)
+  assert.deepEqual(resolvedDefaults.redactColumns, [])
 
   // 4. ConnectionSchema 暴露 url / readOnly / ssl 及其 zh/en i18n 描述
   const connDict = Config.dict.connections.inner.dict
@@ -458,6 +486,156 @@ test('host-config：number 拒绝 Infinity/-Infinity/NaN，toJSON 异常后清�
   for (const badSsl of ['invalid', 123, ['require'], { rejectUnauthorized: 'no' }, { ca: 123 }]) {
     assert.throws(
       () => Config({ connections: [{ name: 'cloud', engine: 'postgres', ssl: badSsl }] }),
+      HostValidationError,
+    )
+  }
+})
+
+test('云数据库 URL sslmode=prefer / verify-ca / allow 与直配 ssl 兼容', () => {
+  const cfg = resolveConfig({
+    connections: [
+      {
+        name: 'neon_prefer',
+        engine: 'postgres',
+        url: 'postgresql://user:pass@ep-demo.us-east-2.aws.neon.tech/neondb?sslmode=prefer',
+      },
+      {
+        name: 'rds_verify_ca',
+        engine: 'postgres',
+        url: 'postgres://admin:pass@mydb.rds.amazonaws.com:5432/prod?sslmode=verify-ca',
+      },
+      {
+        name: 'pg_allow',
+        engine: 'postgres',
+        url: 'postgres://admin:pass@db.internal/app?sslmode=allow',
+      },
+      {
+        name: 'mysql_verify_ca',
+        engine: 'mysql',
+        url: 'mysql://root:pass@mysql.cloud:3306/shop?ssl=verify-ca',
+      },
+      {
+        name: 'mysql_prefer',
+        engine: 'mysql',
+        url: 'mysql://root:pass@mysql.cloud:3306/shop?ssl=prefer',
+      },
+      {
+        name: 'mysql_allow',
+        engine: 'mysql',
+        url: 'mysql://root:pass@mysql.cloud:3306/shop?ssl=allow',
+      },
+    ],
+  })
+  const byName = Object.fromEntries(cfg.connections.map((c) => [c.name, c]))
+  assert.equal(byName.neon_prefer.ssl, 'prefer')
+  assert.equal(byName.rds_verify_ca.ssl, 'verify-ca')
+  assert.equal(byName.pg_allow.ssl, 'allow')
+  assert.equal(byName.mysql_verify_ca.ssl, 'verify-ca')
+  assert.equal(byName.mysql_prefer.ssl, 'prefer')
+  assert.equal(byName.mysql_allow.ssl, 'allow')
+
+  assert.throws(
+    () => resolveConfig({ connections: [{ name: 'bad', engine: 'postgres', url: 'postgres://u@host/db?sslmode=strict' }] }),
+    /disable \/ allow \/ prefer \/ require \/ verify-ca \/ verify-full/,
+  )
+  assert.throws(
+    () => resolveConfig({ connections: [{ name: 'bad', engine: 'mysql', url: 'mysql://u@host/db?ssl=strict' }] }),
+    /disable \/ allow \/ prefer \/ require \/ verify-ca \/ verify-full/,
+  )
+})
+
+test('redactColumns 配置解析：默认关闭、内置模式、自定义数组、正则校验与去重', () => {
+  assert.deepEqual(resolveConfig({}).redactColumns, [])
+  assert.deepEqual(resolveConfig({ redactColumns: undefined }).redactColumns, [])
+  assert.deepEqual(resolveConfig({ redactColumns: false }).redactColumns, [])
+  assert.deepEqual(resolveConfig({ redactColumns: [] }).redactColumns, [])
+
+  const builtIn = resolveConfig({ redactColumns: true }).redactColumns
+  assert.deepEqual(builtIn, [...DEFAULT_REDACT_COLUMN_PATTERNS])
+  assert.notEqual(builtIn, DEFAULT_REDACT_COLUMN_PATTERNS)
+  assert.equal(DEFAULT_REDACT_COLUMN_PATTERNS.includes('password'), true)
+  assert.equal(DEFAULT_REDACT_COLUMN_PATTERNS.includes('session_key'), true)
+  assert.equal(DEFAULT_REDACT_COLUMN_PATTERNS.length, 12)
+
+  const custom = resolveConfig({
+    redactColumns: ['  ssn  ', '/^secret_/i', 'ssn', '/密码|密钥/iu', '/^card_\\d+$/', '/^Exact$/u', '/^secret_/i'],
+  })
+  assert.deepEqual(custom.redactColumns, ['ssn', '/^secret_/i', '/密码|密钥/iu', '/^card_\\d+$/', '/^Exact$/u'])
+
+  for (const badRegex of ['/[unclosed/', '/(broken/i', '//', '//i', '/secret/g', '/secret/gi', '/secret/m', '/secret/ii']) {
+    assert.throws(
+      () => resolveConfig({ redactColumns: [badRegex] }),
+      /redactColumns.*正则/,
+      `expected invalid regex ${badRegex} to throw`,
+    )
+  }
+
+  for (const badValue of [null, 'password', 123, {}, [''], ['   '], [123], [null], ['valid', '']]) {
+    assert.throws(
+      () => resolveConfig({ redactColumns: badValue }),
+      /redactColumns 必须是布尔值或非空字符串数组/,
+      `expected invalid redactColumns ${JSON.stringify(badValue)} to throw`,
+    )
+  }
+})
+
+test('matchRedactedColumns：空模式快路径、不区分大小写子串、/正则/ 与重复列名', () => {
+  assert.deepEqual([...matchRedactedColumns(['id', 'password'], [])], [])
+  assert.deepEqual([...matchRedactedColumns([], ['password'])], [])
+
+  const builtInMatches = matchRedactedColumns(
+    ['id', 'user_password', 'API_KEY', 'authToken', 'email', 'PASSWD_HASH', 'pwd', 'private_key_pem', 'username'],
+    DEFAULT_REDACT_COLUMN_PATTERNS,
+  )
+  assert.deepEqual([...builtInMatches].sort((a, b) => a - b), [1, 2, 3, 5, 6, 7])
+
+  const regexMatches = matchRedactedColumns(
+    ['id', 'secret_id', 'SECRET_KEY', 'my_secret_id', '用户密码', 'Exact', 'exact', 'card_number'],
+    ['/^secret_/', '/密码|密钥/iu', '/^Exact$/u', 'card_'],
+  )
+  assert.deepEqual([...regexMatches].sort((a, b) => a - b), [1, 2, 4, 5, 7])
+
+  const duplicateMatches = matchRedactedColumns(
+    ['id', 'password', 'name', 'PASSWORD', 'secret_token', 'secret_token'],
+    ['password', '/^secret_/i'],
+  )
+  assert.deepEqual([...duplicateMatches].sort((a, b) => a - b), [1, 3, 4, 5])
+})
+
+test('host-config：Config 校验 redactColumns 与扩展 ssl 模式并支持 volatile 热更新', () => {
+  const sslDesc = Config.dict.connections.inner.dict.ssl.meta.description
+  assert.match(sslDesc.zh, /allow \/ prefer \/ require \/ verify-ca \/ verify-full/)
+  assert.match(sslDesc.en, /allow \/ prefer \/ require \/ verify-ca \/ verify-full/)
+
+  const parsedDefault = Config({})
+  assert.equal(parsedDefault.redactColumns.get(), false)
+
+  const parsedTrue = Config({ redactColumns: true })
+  assert.equal(parsedTrue.redactColumns.get(), true)
+  assert.deepEqual(resolveConfig(liveConfig(parsedTrue)).redactColumns, [...DEFAULT_REDACT_COLUMN_PATTERNS])
+
+  const parsedList = Config({
+    redactColumns: ['ssn', '/^secret_/i'],
+    connections: [
+      { name: 'c_allow', engine: 'postgres', database: 'app', ssl: 'allow' },
+      { name: 'c_prefer', engine: 'postgres', database: 'app', ssl: 'prefer' },
+      { name: 'c_verify_ca', engine: 'postgres', database: 'app', ssl: 'verify-ca' },
+    ],
+  })
+  assert.deepEqual(parsedList.redactColumns.get(), ['ssn', '/^secret_/i'])
+  const resolved = resolveConfig(liveConfig(parsedList))
+  assert.deepEqual(resolved.redactColumns, ['ssn', '/^secret_/i'])
+  assert.equal(resolved.connections[0].ssl, 'allow')
+  assert.equal(resolved.connections[1].ssl, 'prefer')
+  assert.equal(resolved.connections[2].ssl, 'verify-ca')
+
+  const writeSym = Symbol.for('cosmokit.volatile.write')
+  parsedDefault.redactColumns[writeSym](parsedList.redactColumns.get())
+  assert.deepEqual(liveConfig(parsedDefault).redactColumns, ['ssn', '/^secret_/i'])
+
+  for (const badRedact of ['password', 123, [123], {}]) {
+    assert.throws(
+      () => Config({ redactColumns: badRedact }),
       HostValidationError,
     )
   }

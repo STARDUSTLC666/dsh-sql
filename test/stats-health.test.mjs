@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { buildSqlTools, resolveConfig, toCsv } from '../lib/index.js'
+import { buildSqlTools, resolveConfig, toCsv, toMarkdownTable } from '../lib/index.js'
 
 const cleanups = []
 
@@ -134,6 +134,19 @@ test('sql_query format=json：可解析回对象数组', async () => {
   assert.deepEqual(parsed, [{ id: 1, note: 'x' }])
 })
 
+test('sql_query format=markdown：含 Markdown 表头、分隔线与管道符转义', async () => {
+  const { tools, exec } = makeTools()
+  await exec.execute({ sql: 'CREATE TABLE t (id INTEGER PRIMARY KEY, note TEXT)' })
+  await exec.execute({ sql: "INSERT INTO t (note) VALUES ('a|b'), ('line1\nline2')" })
+  const query = tools.find((t) => t.name === 'sql_query')
+  const value = await query.execute({ sql: 'SELECT id, note FROM t ORDER BY id', format: 'markdown' })
+  assert.equal(value.format, 'markdown')
+  assert.equal(value.formatted, toMarkdownTable(['id', 'note'], [[1, 'a|b'], [2, 'line1\nline2']]))
+  const blocks = query.output.render({}, value)
+  assert.match(blocks[0].text, /markdown 格式/)
+  assert.ok(blocks[0].text.includes('| 1 | a\\|b |'))
+})
+
 test('sql_query 默认格式不产生 formatted 字段', async () => {
   const { tools, exec } = makeTools()
   await exec.execute({ sql: 'CREATE TABLE t (id INTEGER PRIMARY KEY)' })
@@ -146,7 +159,7 @@ test('toCsv 空结果只输出表头', () => {
   assert.equal(toCsv(['a', 'b'], []), 'a,b')
 })
 
-test('sql_health：连接正常时 ok=true 且汇总安全配置', async () => {
+test('sql_health：连接正常时 ok=true 且汇总安全配置（含 redactColumns 状态与规则数）', async () => {
   const { tools } = makeTools()
   const health = tools.find((t) => t.name === 'sql_health')
   const value = await health.execute({})
@@ -154,9 +167,31 @@ test('sql_health：连接正常时 ok=true 且汇总安全配置', async () => {
   assert.equal(value.connections[0].ok, true)
   assert.equal(value.readOnly, false)
   assert.equal(value.writeApproval, true)
+  assert.equal(value.redactColumns, false)
+  assert.equal(value.redactPatternCount, 0)
   assert.equal(typeof value.maxRows, 'number')
   const blocks = health.output.render({}, value)
   assert.match(blocks[0].text, /自检：正常/)
+  assert.match(blocks[0].text, /敏感列脱敏：关/)
+
+  const redactedBuilt = buildSqlTools(resolveConfig({ redactColumns: true }), () => 'ask')
+  const customRedactedBuilt = buildSqlTools(resolveConfig({ redactColumns: ['phone', '/^ssn$/i'] }), () => 'ask')
+  try {
+    const hDefault = redactedBuilt.tools.find((t) => t.name === 'sql_health')
+    const vDefault = await hDefault.execute({})
+    assert.equal(vDefault.redactColumns, true)
+    assert.equal(vDefault.redactPatternCount, 12)
+    assert.match(hDefault.output.render({}, vDefault)[0].text, /敏感列脱敏：开（12 条规则）/)
+
+    const hCustom = customRedactedBuilt.tools.find((t) => t.name === 'sql_health')
+    const vCustom = await hCustom.execute({})
+    assert.equal(vCustom.redactColumns, true)
+    assert.equal(vCustom.redactPatternCount, 2)
+    assert.match(hCustom.output.render({}, vCustom)[0].text, /敏感列脱敏：开（2 条规则）/)
+  } finally {
+    for (const adapter of redactedBuilt.adapters.values()) await adapter.close()
+    for (const adapter of customRedactedBuilt.adapters.values()) await adapter.close()
+  }
 })
 
 test('sql_health：坏连接报 ok=false 且错误可读', async () => {
@@ -251,6 +286,51 @@ test('pingAllConnections 并发探测：单连接超时/失败不阻塞也不拖
     const controller = new AbortController()
     controller.abort(new Error('caller cancelled ping'))
     await assert.rejects(() => list.execute({}, { signal: controller.signal }), /caller cancelled ping/)
+  } finally {
+    for (const adapter of adapters.values()) await adapter.close()
+  }
+})
+
+test('sql_list / sql_health：ssl=allow / disable 不误标为 [SSL]，prefer / require 正常标记', async () => {
+  const cfg = resolveConfig({
+    connections: [
+      { name: 'pg_allow', engine: 'postgres', database: 'a', ssl: 'allow' },
+      { name: 'pg_disable', engine: 'postgres', database: 'b', ssl: 'disable' },
+      { name: 'pg_prefer', engine: 'postgres', database: 'c', ssl: 'prefer' },
+      { name: 'pg_require', engine: 'postgres', database: 'd', ssl: 'require' },
+    ],
+  })
+  const { tools, adapters } = buildSqlTools(cfg, () => 'ask')
+  const stub = {
+    engine: 'postgres',
+    async listTables() { return [] },
+    async describeTable() { return [] },
+    async query() { return { columns: [], rows: [] } },
+    async exec() { return 0 },
+    async ping() {},
+    async close() {},
+  }
+  for (const c of cfg.connections) adapters.set(c.name, stub)
+  try {
+    const list = tools.find((t) => t.name === 'sql_list')
+    const health = tools.find((t) => t.name === 'sql_health')
+    const listRes = await list.execute({})
+    const byName = Object.fromEntries(listRes.connections.map((c) => [c.name, c]))
+    assert.equal(byName.pg_allow.ssl, undefined)
+    assert.equal(byName.pg_disable.ssl, undefined)
+    assert.equal(byName.pg_prefer.ssl, true)
+    assert.equal(byName.pg_require.ssl, true)
+
+    const listText = list.output.render({}, listRes)[0].text
+    assert.doesNotMatch(listText, /pg_allow.*\[.*SSL.*\]/)
+    assert.doesNotMatch(listText, /pg_disable.*\[.*SSL.*\]/)
+    assert.match(listText, /pg_prefer.*\[SSL\]/)
+    assert.match(listText, /pg_require.*\[SSL\]/)
+
+    const healthRes = await health.execute({})
+    const hByName = Object.fromEntries(healthRes.connections.map((c) => [c.name, c]))
+    assert.equal(hByName.pg_allow.ssl, undefined)
+    assert.equal(hByName.pg_prefer.ssl, true)
   } finally {
     for (const adapter of adapters.values()) await adapter.close()
   }

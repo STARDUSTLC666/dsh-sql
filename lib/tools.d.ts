@@ -1,11 +1,6 @@
-/**
- * 六个面向模型的数据库工具：sql_list / sql_query / sql_exec / sql_schema / sql_stats / sql_health。
- *
- * @module dsh-sql/tools
- */
 import { type DatabaseAdapter } from './adapters.js';
 import { type ResolvedSqlConfig } from './config.js';
-export { assertReadQuery, summarizeWriteScript, splitSqlStatements, stripSqlNoise, type SqlEngine } from './sql-lexer.js';
+export { analyzeWriteRisks, assertReadQuery, isCursorEligibleQuery, summarizeWriteScript, splitSqlStatements, stripSqlNoise, type SqlEngine, type WriteRiskKind, type WriteRiskWarning, } from './sql-lexer.js';
 /** 模型可见的内容块。 */
 export interface ContentBlock {
     type: 'text';
@@ -38,6 +33,8 @@ export interface SqlToolDefinition {
 export declare function connectionErrorHint(message: string): string | undefined;
 /** 给错误补一行「下一步」；无法识别时原样返回，避免把断言类错误改写成连接问题。 */
 export declare function annotateError(error: unknown): Error;
+/** 查询结果转 GitHub 风格 Markdown 表格。 */
+export declare function toMarkdownTable(columns: string[], rows: unknown[][], maxCellLen?: number): string;
 /** 查询结果转 CSV 文本（RFC 4180 风格转义）。 */
 export declare function toCsv(columns: string[], rows: unknown[][]): string;
 /** 审批执行上下文的最小面。 */

@@ -30,9 +30,9 @@ For the web profile, replace `desktop` with `web`. Restart DSH once after instal
 <a id="start-using-it"></a>
 ## Get Started in 3 Steps
 
-1. **Add your database in DSH Settings (applies live)**: Open **DSH Settings → Plugins → SQL (`dsh-sql`)** and add SQLite, MySQL, or PostgreSQL connections (also supports `url` connection URIs and cloud DB `ssl` modes `disable` / `require` / `verify-full`; passwords are masked or read from `DSH_SQL_PASSWORD_<NAME>`; lock writes globally or per connection with `readOnly`).
-2. **Explore schema & table sizes first**: Ask the assistant to check database health, filter tables by `schema` / `pattern`, and inspect columns, defaults, comments, indexes, and foreign keys before writing queries.
-3. **Query safely, approve writes explicitly**: `sql_query` supports `limit`, parameterized `params`, and `table`/`csv`/`json` output, backed by engine-level read-only enforcement (SQLite `PRAGMA query_only`, MySQL/PostgreSQL independent `READ ONLY` transactions) and server-side query timeouts; `sql_exec` supports parameterized writes and multi-statement scripts across all three engines, showing the target connection and every SQL statement in the approval card before executing.
+1. **Add your database in DSH Settings (applies live)**: Open **DSH Settings → Plugins → SQL (`dsh-sql`)** and add SQLite, MySQL, or PostgreSQL connections (supports `url` connection URIs with `?sslmode=` and cloud DB `ssl` modes `disable` / `allow` / `prefer` / `require` / `verify-ca` / `verify-full` plus `{ rejectUnauthorized, ca }`; passwords are masked or read from `DSH_SQL_PASSWORD_<NAME>`; lock writes globally or per connection with `readOnly`, and optionally enable live-reloadable `redactColumns` masking).
+2. **Explore schema & table sizes first**: Ask the assistant to check database health, filter tables by `schema` / `pattern` (including PostgreSQL materialized views), and inspect one `table` or up to 20 `tables` concurrently for columns, defaults, PostgreSQL `enumValues`, comments, indexes, and foreign keys before writing queries.
+3. **Query safely, approve writes explicitly**: `sql_query` supports `limit`, parameterized `params`, `table`/`markdown`/`csv`/`json` output (default `table` renders as GFM Markdown tables), `durationMs` timing, and `redactColumns` masking (`[REDACTED]`), backed by engine-level read-only enforcement (SQLite `PRAGMA query_only`, MySQL/PostgreSQL independent `READ ONLY` transactions with PG `NO SCROLL CURSOR` connection reuse) plus server-side timeouts and cancellation; `sql_exec` supports parameterized writes, multi-statement scripts across all three engines, and server-side write timeouts, showing the target connection, bound `params`, every SQL statement, and automatic `⚠️ 高危提示` warnings (`DROP` / `TRUNCATE` / unfiltered `DELETE` / `UPDATE`) in the approval card (fast-denying unknown connections) before executing.
 
 ## Copy-Ready Prompts for Everyday Work
 
@@ -49,9 +49,9 @@ For the web profile, replace `desktop` with `web`. Restart DSH once after instal
 | :--- | :--- | :--- |
 | Only `default (:memory:)` appears with 0 tables | No external database configured yet | Add your connection in **DSH Settings → Plugins → SQL** and save (applies live) |
 | `ECONNREFUSED` / `ETIMEDOUT` | DB server stopped, wrong `host`/`port`, or firewall | Verify host, port, and server status in Settings, then re-run health check |
-| TLS/SSL handshake or certificate error | Cloud DB requires TLS or self-signed cert failed verification | Set `ssl` on the connection (`require` or `verify-full` for cloud DBs; `{ rejectUnauthorized: false }` or `ca` for self-signed certs; `disable` only on trusted local networks) |
+| TLS/SSL handshake or certificate error | Cloud DB requires TLS, self-signed cert failed, or CA path missing | Set `ssl` or `url` `?sslmode=` (`disable` / `allow` / `prefer` / `require` / `verify-ca` / `verify-full`; `{ rejectUnauthorized: false }` or an existing `ca` file / PEM cert for self-signed certs; `disable` only on trusted local networks) |
 | `Access denied` / `password authentication failed` | Wrong username or password | Update `user`/`password` in Settings or set `DSH_SQL_PASSWORD_<CONNECTION_UPPER>` |
-| Write says confirmation is unavailable (`never`) | Session policy blocks interactive approval prompts | Switch to an interactive (`ask`) session mode so write approval cards can appear |
+| Write says confirmation is unavailable (`never`) | Session policy blocks interactive approval prompts | Switch to an interactive (`ask`) session mode for write approval cards, or mark global / all connections `readOnly` if writes are not needed |
 
 ## Plugin updates
 

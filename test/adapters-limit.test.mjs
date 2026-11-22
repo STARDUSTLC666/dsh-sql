@@ -7,7 +7,7 @@ import MysqlQuery from '../node_modules/mysql2/lib/commands/query.js'
 import pg from 'pg'
 import { createAdapter, mysqlPoolConfig, postgresPoolConfig } from '../lib/index.js'
 
-function pgFixture(values, { fail = false, stall = false, columns = ['a'], failControl } = {}) {
+function pgFixture(values, { fail = false, stall = false, columns = ['a'], failControl, dataTypeID = 23 } = {}) {
   const adapter = createAdapter({ name: 'pg', engine: 'postgres', database: 'app' })
   const state = { released: [], produced: 0, query: undefined, commands: [], lastQueryConfig: undefined }
   adapter.pool = {
@@ -30,7 +30,7 @@ function pgFixture(values, { fail = false, stall = false, columns = ['a'], failC
           queueMicrotask(() => {
             if (stall) return
             if (fail) return query.emit('error', new Error('pg query failed'))
-            query.handleRowDescription({ fields: columns.map(name => ({ name, dataTypeID: 23, format: 'text' })) })
+            query.handleRowDescription({ fields: columns.map(name => ({ name, dataTypeID, format: 'text' })) })
             for (const value of values) {
               if (state.released.includes(true)) break
               state.produced += 1
@@ -350,18 +350,20 @@ test('mysqlPoolConfig / postgresPoolConfig：超时默认值与 SSL 选项映射
   assert.equal(basePg.connectionTimeoutMillis, 10000)
   assert.equal(basePg.ssl, undefined)
 
-  for (const disabled of [false, 'disable']) {
+  for (const disabled of [false, 'disable', 'allow']) {
     assert.equal(mysqlPoolConfig({ name: 'm', engine: 'mysql', database: 'app', ssl: disabled }).ssl, undefined)
     assert.equal(postgresPoolConfig({ name: 'p', engine: 'postgres', database: 'app', ssl: disabled }).ssl, undefined)
   }
 
-  for (const relaxed of [true, 'require']) {
+  for (const relaxed of [true, 'prefer', 'require']) {
     assert.deepEqual(mysqlPoolConfig({ name: 'm', engine: 'mysql', database: 'app', ssl: relaxed }).ssl, { rejectUnauthorized: false })
     assert.deepEqual(postgresPoolConfig({ name: 'p', engine: 'postgres', database: 'app', ssl: relaxed }).ssl, { rejectUnauthorized: false })
   }
 
-  assert.deepEqual(mysqlPoolConfig({ name: 'm', engine: 'mysql', database: 'app', ssl: 'verify-full' }).ssl, { rejectUnauthorized: true })
-  assert.deepEqual(postgresPoolConfig({ name: 'p', engine: 'postgres', database: 'app', ssl: 'verify-full' }).ssl, { rejectUnauthorized: true })
+  for (const strict of ['verify-ca', 'verify-full']) {
+    assert.deepEqual(mysqlPoolConfig({ name: 'm', engine: 'mysql', database: 'app', ssl: strict }).ssl, { rejectUnauthorized: true })
+    assert.deepEqual(postgresPoolConfig({ name: 'p', engine: 'postgres', database: 'app', ssl: strict }).ssl, { rejectUnauthorized: true })
+  }
 
   const pem = '-----BEGIN CERTIFICATE-----\nMIIBFAKE\n-----END CERTIFICATE-----\n'
   assert.deepEqual(
@@ -380,6 +382,15 @@ test('mysqlPoolConfig / postgresPoolConfig：超时默认值与 SSL 选项映射
     assert.deepEqual(
       postgresPoolConfig({ name: 'p', engine: 'postgres', database: 'app', ssl: { rejectUnauthorized: true, ca: caPath } }).ssl,
       { rejectUnauthorized: true, ca: pem },
+    )
+    const missingCa = join(dir, 'missing-ca.pem')
+    assert.throws(
+      () => mysqlPoolConfig({ name: 'm', engine: 'mysql', database: 'app', ssl: { ca: missingCa } }),
+      new RegExp('SSL CA 证书文件不存在：.*missing-ca\\.pem.*请检查文件路径或直接提供 PEM 证书内容'),
+    )
+    assert.throws(
+      () => postgresPoolConfig({ name: 'p', engine: 'postgres', database: 'app', ssl: { rejectUnauthorized: true, ca: '  ' + missingCa + '  ' } }),
+      new RegExp('SSL CA 证书文件不存在：.*missing-ca\\.pem.*请检查文件路径或直接提供 PEM 证书内容'),
     )
   } finally {
     rmSync(dir, { recursive: true, force: true })
@@ -494,25 +505,179 @@ test('PostgreSQL：exec 多语句累加数组 rowCount、支持 params 并拦截
   assert.equal(await adapter.exec('/* comment only */ ;'), 0)
 })
 
-test('MySQL / PostgreSQL：listTables 支持多 schema 与显式 schema 过滤', async () => {
+test('PostgreSQL：useCursor=true 走扩展协议 DECLARE/FETCH 并干净归还连接；EXPLAIN 与参数化回退流式', async () => {
+  const adapter = createAdapter({ name: 'pg-cursor', engine: 'postgres', database: 'app' })
+  const seen = []
+  const released = []
+  adapter.pool = {
+    async connect() {
+      return {
+        release(force) { released.push(force === true) },
+        query(q) {
+          seen.push(q)
+          if (typeof q === 'string') return Promise.resolve({})
+          if (q.text.startsWith('DECLARE _dsh_cursor NO SCROLL CURSOR FOR ')) {
+            return Promise.resolve({})
+          }
+          if (q.text.startsWith('FETCH ')) {
+            return Promise.resolve({
+              fields: [{ name: 'id' }, { name: 'id' }, { name: 'big' }],
+              rows: [[1, 2, 9007199254740993n], [3, 4, 7n]],
+            })
+          }
+          throw new Error('unexpected cursor query: ' + q.text)
+        },
+      }
+    },
+  }
+
+  const res = await adapter.query('SELECT id, id, big FROM items', 2, undefined, { useCursor: true, timeoutMs: 4500 })
+  assert.deepEqual(res, {
+    columns: ['id', 'id', 'big'],
+    rows: [[1, 2, '9007199254740993'], [3, 4, 7]],
+  })
+  assert.deepEqual(released, [false], 'cursor path must return connection cleanly without destroying it')
+  assert.equal(seen[0], 'BEGIN READ ONLY')
+  assert.equal(seen[1], 'SET LOCAL statement_timeout = 4500')
+  assert.deepEqual(seen[2], {
+    text: 'DECLARE _dsh_cursor NO SCROLL CURSOR FOR SELECT id, id, big FROM items',
+    queryMode: 'extended',
+  })
+  assert.deepEqual(seen[3], {
+    text: 'FETCH 2 FROM _dsh_cursor',
+    rowMode: 'array',
+    queryMode: 'extended',
+  })
+  assert.equal(seen[4], 'ROLLBACK')
+
+  // WITH CTE 也应走游标路径
+  seen.length = 0
+  released.length = 0
+  await adapter.query('WITH cte AS (SELECT 1 AS x) SELECT x FROM cte', 5, undefined, { useCursor: true })
+  assert.equal(seen[1].text, 'DECLARE _dsh_cursor NO SCROLL CURSOR FOR WITH cte AS (SELECT 1 AS x) SELECT x FROM cte')
+  assert.equal(seen[2].text, 'FETCH 5 FROM _dsh_cursor')
+  assert.deepEqual(released, [false])
+
+  // 末尾分号与分号后注释应被剥离，字符串内分号保持原样
+  for (const [rawSql, expectedClean] of [
+    ['SELECT 1;', 'SELECT 1'],
+    ['SELECT 1; -- trailing note', 'SELECT 1'],
+    ['SELECT 1;;', 'SELECT 1'],
+    ["SELECT ';'; /* note */", "SELECT ';'"],
+  ]) {
+    seen.length = 0
+    released.length = 0
+    await adapter.query(rawSql, 5, undefined, { useCursor: true })
+    assert.deepEqual(seen[1], {
+      text: 'DECLARE _dsh_cursor NO SCROLL CURSOR FOR ' + expectedClean,
+      queryMode: 'extended',
+    })
+    assert.deepEqual(released, [false])
+  }
+
+  // EXPLAIN 不可走游标：回退到 streamPostgresQuery（使用 pg.Query）
+  const explainFix = pgFixture(['Seq Scan on t'], { columns: ['QUERY PLAN'], dataTypeID: 25 })
+  const explainRes = await explainFix.adapter.query('EXPLAIN SELECT 1', 10, undefined, { useCursor: true })
+  assert.deepEqual(explainRes, { columns: ['QUERY PLAN'], rows: [['Seq Scan on t']] })
+  assert.ok(explainFix.state.query instanceof pg.Query)
+  assert.deepEqual(explainFix.state.commands, ['BEGIN READ ONLY', 'EXPLAIN SELECT 1', 'ROLLBACK'])
+
+  // 带参数查询不可走游标：回退到 streamPostgresQuery（使用 pg.Query）
+  const paramFix = pgFixture([42])
+  const paramRes = await paramFix.adapter.query('SELECT $1::int AS a', 10, undefined, { useCursor: true, params: [42] })
+  assert.deepEqual(paramRes, { columns: ['a'], rows: [[42]] })
+  assert.ok(paramFix.state.query instanceof pg.Query)
+  assert.deepEqual(paramFix.state.lastQueryConfig.values, [42])
+  assert.deepEqual(paramFix.state.commands, ['BEGIN READ ONLY', 'SELECT $1::int AS a', 'ROLLBACK'])
+})
+
+test('PostgreSQL：exec 在提供 timeoutMs 时设置并重置 statement_timeout，重置失败不掩盖主错误', async () => {
+  function makeExecFixture({ failSet = false, failMain = false, failReset = false, result = { rowCount: 2 } } = {}) {
+    const adapter = createAdapter({ name: 'pg-exec-to', engine: 'postgres', database: 'app' })
+    const commands = []
+    const released = []
+    adapter.pool = {
+      async connect() {
+        return {
+          release(force) { released.push(force === true) },
+          async query(sql, values) {
+            commands.push({ sql, values })
+            if (typeof sql === 'string' && sql.startsWith('SET statement_timeout = ')) {
+              if (failSet) throw new Error('set timeout failed')
+              return {}
+            }
+            if (sql === 'RESET statement_timeout') {
+              if (failReset) throw new Error('reset timeout failed')
+              return {}
+            }
+            if (failMain) throw new Error('primary exec failed')
+            return result
+          },
+        }
+      },
+    }
+    return { adapter, commands, released }
+  }
+
+  // 单语句 + 多语句 + 带参数 + timeoutMs
+  const okSingle = makeExecFixture({ result: { rowCount: 3 } })
+  assert.equal(await okSingle.adapter.exec('UPDATE t SET v = $1', undefined, { params: ['x'], timeoutMs: 8000 }), 3)
+  assert.deepEqual(okSingle.commands, [
+    { sql: 'SET statement_timeout = 8000', values: undefined },
+    { sql: 'UPDATE t SET v = $1', values: ['x'] },
+    { sql: 'RESET statement_timeout', values: undefined },
+  ])
+  assert.deepEqual(okSingle.released, [false])
+
+  const okMulti = makeExecFixture({ result: [{ rowCount: 1 }, { rowCount: 4 }] })
+  assert.equal(await okMulti.adapter.exec('INSERT INTO a VALUES (1); INSERT INTO b VALUES (2);', undefined, { timeoutMs: 12000 }), 5)
+  assert.equal(okMulti.commands[0].sql, 'SET statement_timeout = 12000')
+  assert.equal(okMulti.commands[2].sql, 'RESET statement_timeout')
+  assert.deepEqual(okMulti.released, [false])
+
+  // SET statement_timeout 失败：销毁连接且不执行主语句或 RESET
+  const badSet = makeExecFixture({ failSet: true })
+  await assert.rejects(() => badSet.adapter.exec('DELETE FROM t', undefined, { timeoutMs: 5000 }), /set timeout failed/)
+  assert.deepEqual(badSet.commands, [{ sql: 'SET statement_timeout = 5000', values: undefined }])
+  assert.deepEqual(badSet.released, [true])
+
+  // 主语句成功但 RESET 失败：销毁连接并抛出 RESET 错误
+  const badReset = makeExecFixture({ failReset: true })
+  await assert.rejects(() => badReset.adapter.exec('DELETE FROM t', undefined, { timeoutMs: 5000 }), /reset timeout failed/)
+  assert.deepEqual(badReset.released, [true])
+
+  // 主语句失败且 RESET 也失败：销毁连接并保留主错误
+  const bothFail = makeExecFixture({ failMain: true, failReset: true })
+  await assert.rejects(() => bothFail.adapter.exec('BEGIN; INSERT INTO bad VALUES (1); COMMIT', undefined, { timeoutMs: 5000 }), /primary exec failed/)
+  assert.equal(bothFail.commands.at(-1).sql, 'RESET statement_timeout')
+  assert.deepEqual(bothFail.released, [true])
+})
+
+test('MySQL / PostgreSQL：listTables 支持多 schema、显式 schema 过滤与 PG 物化视图', async () => {
   const pgAdapter = createAdapter({ name: 'pg', engine: 'postgres', database: 'app' })
   const pgCalls = []
   pgAdapter.pool = {
     async query(sql, values) {
       pgCalls.push({ sql, values })
       if (values !== undefined) {
-        return { rows: [{ table_schema: values[0], table_name: 'events' }] }
+        return { rows: [{ table_schema: values[0], table_name: 'events' }, { table_schema: values[0], table_name: 'mv_daily' }] }
       }
       return {
         rows: [
+          { table_schema: 'public', table_name: 'mv_summary' },
           { table_schema: 'public', table_name: 'users' },
           { table_schema: 'analytics', table_name: 'events' },
         ],
       }
     },
   }
-  assert.deepEqual(await pgAdapter.listTables(), ['users', 'analytics.events'])
-  assert.deepEqual(await pgAdapter.listTables(undefined, 'analytics'), ['analytics.events'])
+  assert.deepEqual(await pgAdapter.listTables(), ['mv_summary', 'users', 'analytics.events'])
+  assert.deepEqual(await pgAdapter.listTables(undefined, 'analytics'), ['analytics.events', 'analytics.mv_daily'])
+  assert.match(pgCalls[0].sql, /pg_catalog\.pg_class/)
+  assert.match(pgCalls[0].sql, /relkind IN \('r', 'p', 'v', 'm', 'f'\)/)
+  assert.match(pgCalls[0].sql, /NOT LIKE 'pg_toast%'/)
+  assert.match(pgCalls[0].sql, /NOT LIKE 'pg_temp%'/)
+  assert.match(pgCalls[1].sql, /relkind IN \('r', 'p', 'v', 'm', 'f'\)/)
   assert.deepEqual(pgCalls[1].values, ['analytics'])
 
   const myAdapter = createAdapter({ name: 'my', engine: 'mysql', database: 'app' })

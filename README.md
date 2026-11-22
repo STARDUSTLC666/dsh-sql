@@ -30,9 +30,9 @@ dsh plugin --profile desktop add dsh-sql
 <a id="开始使用"></a>
 ## 最快 3 步用起来
 
-1. **在原生设置添加数据库连接（保存即生效）**：打开 DSH「**设置 → 插件 → 数据库（dsh-sql）**」，添加 SQLite 文件、MySQL 或 PostgreSQL 连接（支持直接粘贴 `url` 连接串，云数据库可配 `ssl` 模式 `disable` / `require` / `verify-full`；密码自动脱敏，也可用环境变量 `DSH_SQL_PASSWORD_<连接名大写>`；支持全局或单连接 `readOnly` 锁死写入）。
-2. **先探查结构与规模**：让助手先跑连通性自检，按 `schema` / `pattern` 列出表清单并查看字段、默认值、注释、索引与外键，再查业务数据，避免盲猜表名或扫崩大表。
-3. **只读回答日常问题，写操作逐条审批**：`sql_query` 支持 `limit`、参数化 `params` 与 `table`/`csv`/`json` 格式，自动走引擎级只读保护（SQLite `PRAGMA query_only`、MySQL/PostgreSQL 独立只读事务）与服务端查询超时；确需修改数据时，`sql_exec` 支持参数化写入与三引擎多语句脚本，审批卡会标明目标连接并完整列出每条 SQL，经你确认后才执行。
+1. **在原生设置添加数据库连接（保存即生效）**：打开 DSH「**设置 → 插件 → 数据库（dsh-sql）**」，添加 SQLite 文件、MySQL 或 PostgreSQL 连接（支持直接粘贴 `url` 连接串与 `?sslmode=`，云数据库 `ssl` 兼容 `disable` / `allow` / `prefer` / `require` / `verify-ca` / `verify-full` 及 `{ rejectUnauthorized, ca }`；密码自动脱敏，也可用环境变量 `DSH_SQL_PASSWORD_<连接名大写>`；支持全局或单连接 `readOnly` 锁死写入，以及热更新的 `redactColumns` 敏感列脱敏）。
+2. **先探查结构与规模**：让助手先跑连通性自检，按 `schema` / `pattern` 列出表清单（PostgreSQL 含物化视图），并用 `table` 或批量 `tables`（最多 20 张表并发）查看字段、默认值、PostgreSQL 枚举值（`enumValues`）、注释、索引与外键，再查业务数据，避免盲猜表名或扫崩大表。
+3. **只读回答日常问题，写操作逐条审批**：`sql_query` 支持 `limit`、参数化 `params`、`table`/`markdown`/`csv`/`json` 格式（默认 `table` 以 GFM Markdown 表格渲染）、执行耗时 `durationMs` 与 `redactColumns` 脱敏（`[REDACTED]`），自动走引擎级只读保护（SQLite `PRAGMA query_only`、MySQL/PostgreSQL 独立只读事务与 PG `NO SCROLL CURSOR` 连接复用）及服务端超时与取消；确需修改数据时，`sql_exec` 支持参数化写入、三引擎多语句脚本与服务端写超时，审批卡会标明目标连接、绑定 `params`、每条 SQL 及 `⚠️ 高危提示`（`DROP` / `TRUNCATE` / 无 `WHERE` 的 `DELETE` / `UPDATE`），未知连接名直接快速拒绝，经你确认后才执行。
 
 ## 平时怎么对助手说（可直接复制的自然语言示例）
 
@@ -49,9 +49,9 @@ dsh plugin --profile desktop add dsh-sql
 | :--- | :--- | :--- |
 | 只看到 `default (:memory:)` 且没有业务表 | 还没配置外部数据库连接，当前在用内置临时内存库 | 打开 DSH「设置 → 插件 → 数据库」添加连接并保存（立即生效，无需重启） |
 | `ECONNREFUSED` / `ETIMEDOUT` | 数据库未启动、`host`/`port` 填错或防火墙拦截 | 核对服务端口与连接配置后重新运行自检 |
-| TLS/SSL 握手或证书校验失败 | 云数据库要求加密连接，或自签名证书未通过校验 | 在连接配置中设置 `ssl`（云库常用 `require` 或 `verify-full`，自签名可用 `{ rejectUnauthorized: false }` 或配置 `ca` 证书；仅本地可信网络设 `disable`） |
+| TLS/SSL 握手或证书校验失败 | 云数据库要求加密连接，或自签名/CA 证书路径有误 | 在连接配置中设置 `ssl` 或 `url` `?sslmode=`（支持 `disable` / `allow` / `prefer` / `require` / `verify-ca` / `verify-full`，自签名可用 `{ rejectUnauthorized: false }` 或配置存在的 `ca` 文件/PEM 证书；仅本地可信网络设 `disable`） |
 | `Access denied` / `password authentication failed` | 用户名或密码错误 | 在「设置 → 插件 → 数据库」重填密码，或设置环境变量 `DSH_SQL_PASSWORD_<连接名大写>` |
-| 写操作提示「当前策略 never 无法询问」 | 会话处于不弹窗模式，写审批门为安全拒绝静默执行 | 切回可询问（ask）会话模式，使审批卡正常弹出 |
+| 写操作提示「当前策略 never 无法询问」 | 会话处于不弹窗模式，写审批门为安全拒绝静默执行 | 切回可询问（ask）会话模式使审批卡弹出；若仅需只读，开启全局或全部连接 `readOnly` 后自检自动放行 |
 
 ## 插件更新
 
