@@ -49,9 +49,8 @@ function compileParameters(spec: Record<string, any>): { type: 'object'; propert
     if (typeof prop?.type === 'string') node.type = prop.type
     if (typeof prop?.description === 'string') node.description = prop.description
     if (Array.isArray(prop?.enum)) node.enum = prop.enum
-    if (prop?.items !== undefined && typeof prop.items === 'object' && prop.items !== null) node.items = prop.items
-    if (typeof prop?.minimum === 'number') node.minimum = prop.minimum
-    if (typeof prop?.maximum === 'number') node.maximum = prop.maximum
+    if (prop?.items !== undefined && typeof prop.items === 'object' && prop.items !== null && !Array.isArray(prop.items)) node.items = prop.items
+    // 宿主 @deepseek-ai/dsh-tools 仅支持受限 JSON Schema 子集，不输出 minimum / maximum 等关键字（运行时由参数校验器强制范围）。
     properties[key] = node
   }
   return { type: 'object', properties, ...(required.length > 0 ? { required } : {}) }
@@ -245,8 +244,8 @@ const schemaColumnItemSchema = {
     type: { type: 'string' },
     notNull: { type: 'boolean' },
     primaryKey: { type: 'boolean' },
-    defaultValue: { type: ['string', 'null'] },
-    comment: { type: ['string', 'null'] },
+    defaultValue: { oneOf: [{ type: 'string' }, { type: 'null' }] },
+    comment: { oneOf: [{ type: 'string' }, { type: 'null' }] },
     enumValues: { type: 'array', items: { type: 'string' } },
   },
   additionalProperties: true,
@@ -680,7 +679,7 @@ export function buildSqlTools(
     parameters: compileParameters({
       sql: { type: 'string', required: true, description: '只读 SQL 语句（必填，单条）。' },
       connection: { type: 'string', description: '连接名（可选，缺省第一个连接）。' },
-      limit: { type: 'integer', minimum: 1, description: '本次最多返回行数（可选，不能超过全局 maxRows）。' },
+      limit: { type: 'integer', description: '本次最多返回行数（可选，需为 >= 1 的整数，不能超过全局 maxRows）。' },
       params: { type: 'array', items: {}, description: '参数化查询绑定值数组（可选；SQLite/MySQL 用 ?，PostgreSQL 用 $1/$2）。' },
       format: { type: 'string', enum: ['table', 'markdown', 'csv', 'json'], description: '输出格式：table（默认表格）/ markdown / csv / json。markdown / csv / json 会额外返回 formatted 文本，便于展示、落盘或转存。' },
     }),

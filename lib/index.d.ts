@@ -37,7 +37,16 @@ export interface SqlPluginContext extends ApprovalContext {
     tools: {
         register(definition: SqlToolDefinition): () => void;
     };
-    effect?(effect: () => () => unknown, label?: string): unknown;
+    fiber?: {
+        entry?: {
+            options?: {
+                id?: string;
+            };
+        };
+    };
+    settings?: unknown;
+    inject?(deps: readonly string[], callback: (ctx: any) => void): unknown;
+    effect?(effect: () => (() => unknown) | void, label?: string): unknown;
     on(event: 'tools/pre-execute', listener: SqlPreExecuteListener): () => void;
     on(event: 'dispose', listener: () => void): () => void;
 }
@@ -49,3 +58,4 @@ export * from './adapters.js';
 export * from './config.js';
 export { liveConfig, createVolatile, HostValidationError, type HostSchemaNode, type HostSchemaMeta, type VolatileRef } from './host-config.js';
 export * from './tools.js';
+export * from './web.js';

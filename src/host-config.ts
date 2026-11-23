@@ -192,6 +192,25 @@ function checkRange(value: number, meta: HostSchemaMeta, label: string, options:
   if (value < min && !skipMin) throw new HostValidationError(`expected ${label} >= ${min} but got ${value}`, options)
 }
 
+function decimalShift(data: number, digits: number): number {
+  const str = data.toString()
+  if (str.includes('e')) return data * Math.pow(10, digits)
+  const index = str.indexOf('.')
+  if (index === -1) return data * Math.pow(10, digits)
+  const frac = str.slice(index + 1)
+  const integer = str.slice(0, index)
+  if (frac.length <= digits) return +(integer + frac.padEnd(digits, '0'))
+  return +(integer + frac.slice(0, digits) + '.' + frac.slice(digits))
+}
+
+function isMultipleOf(data: number, min: number, step: number): boolean {
+  const absStep = Math.abs(step)
+  if (!/^\d+\.\d+$/.test(absStep.toString())) return (data - min) % absStep === 0
+  const index = absStep.toString().indexOf('.')
+  const digits = absStep.toString().slice(index + 1).length
+  return Math.abs(decimalShift(data, digits) - decimalShift(min, digits)) % decimalShift(absStep, digits) === 0
+}
+
 function resolveProperty(data: Record<string, unknown> | unknown[], key: string | number, schema: HostSchemaNode, options: HostSchemaOptions): unknown {
   const container = data as Record<string | number, unknown>
   try {
@@ -248,6 +267,10 @@ function resolveSchema(data: unknown, schema: HostSchemaNode | undefined, option
       case 'number': {
         if (typeof data !== 'number' || !Number.isFinite(data)) throw new HostValidationError(`expected number but got ${String(data)}`, options)
         checkRange(data, schema.meta, 'number', options)
+        const { step } = schema.meta
+        if (step && !isMultipleOf(data, schema.meta.min ?? 0, step)) {
+          throw new HostValidationError(`expected number multiple of ${step} but got ${data}`, options)
+        }
         return [data]
       }
       case 'boolean':
@@ -505,7 +528,7 @@ const ConnectionSchema = z.object<SqlConnectionConfig>({
     .description('可选连接 URI（postgres:// / postgresql:// / mysql:// / sqlite: / file:；显式字段优先；建议密码改用下方脱敏密码字段或环境变量）'),
   file: z.string().description('SQLite 数据库文件路径（或 :memory:）'),
   host: z.string().description('MySQL / PostgreSQL 主机地址（默认 localhost）'),
-  port: z.number().min(1).max(65535).step(1).description('端口号（PostgreSQL 默认 5432，MySQL 默认 3306）'),
+  port: z.number().min(1).max(65535).description('端口号（PostgreSQL 默认 5432，MySQL 默认 3306）'),
   user: z.string().description('数据库登录用户名'),
   password: z.string().role('secret')
     .description('数据库密码（自动脱敏；留空时自动读取环境变量 DSH_SQL_PASSWORD_<连接名大写>）'),
@@ -531,15 +554,15 @@ const ConnectionSchema = z.object<SqlConnectionConfig>({
 export const Config: HostSchemaNode<SqlConfig> = z.object<SqlConfig>({
   connections: z.array(ConnectionSchema).volatile()
     .description('数据库连接列表（保存即生效；未配置时默认提供临时 :memory: SQLite 连接）'),
-  maxRows: z.number().min(1).max(10000).step(100).default(1000).volatile()
+  maxRows: z.number().min(1).max(10000).default(1000).volatile()
     .description('单次只读查询最多返回行数（1–10000，默认 1000）'),
   readOnly: z.boolean().default(false).volatile()
     .description('全局只读开关（开启后禁用 sql_exec 并以只读方式连接数据库）'),
   writeApproval: z.boolean().default(true).volatile()
     .description('写操作审批门（默认开启；每次 sql_exec 前展示语句清单请求确认）'),
-  queryTimeoutMs: z.number().min(5000).max(600000).step(1000).default(60000).volatile()
+  queryTimeoutMs: z.number().min(5000).max(600000).default(60000).volatile()
     .description('单次只读查询超时毫秒数（默认 60000）'),
-  execTimeoutMs: z.number().min(5000).max(600000).step(1000).default(120000).volatile()
+  execTimeoutMs: z.number().min(5000).max(600000).default(120000).volatile()
     .description('单次写操作超时毫秒数（默认 120000）'),
   redactColumns: z.union<boolean | string[]>([z.boolean(), z.array(z.string())]).default(false).volatile()
     .description('敏感列自动脱敏（false 关闭；true 启用内置 password/secret/token 等脱敏；或填列名子串与 /正则/ 数组）'),

@@ -1,5 +1,12 @@
 # 更新记录
 
+## 0.9.0 (2026-11-23)
+
+- 修复 DSH 0.2.2 宿主工具 Schema 校验触发回滚问题（#4、#5）：将 `sql_schema` 输出定义中的 4 处 `type: ['string', 'null']` 数组写法替换为宿主允许的 `oneOf: [{ type: 'string' }, { type: 'null' }]`，并移除 `sql_query.parameters.properties.limit` 上不被 `@deepseek-ai/dsh-tools` 支持的 `minimum` 约束关键字（继续保留运行时严格边界校验）。
+- 修复 `@deepseek-ai/schemastery@3.19.0` 加载配置报错问题（#5）：移除与 `min(1)` / `min(5000)` 冲突的 `.step(100)` / `.step(1000)` / `.step(1)` 约束（此前会导致默认 `maxRows: 1000` 因 `(1000 - 1) % 100 === 99` 被拒并阻塞启动），同步对齐 `src/host-config.ts` 的 step 校验行为，并新增覆盖宿主真实 Schema 与配置校验契约的回归测试 `test/host-contract.test.mjs`。
+- 新增原生可视化数据库设置界面与认证后端（#5）：在 DSH「设置 → 数据库」（`settings.section`）、「设置 → 内置插件 → 数据库」（`settings.plugins.tab`）与「插件 → 数据库」（`plugins.bundle.config`）三大官方入口提供中英双语、适配深浅主题的可视化管理面板；支持 SQLite / MySQL / PostgreSQL 连接增删改、URI 连接串、6 档云库 SSL 与自定义多行 PEM CA 证书、单连接只读、密码留空保留与清除、一键「测试连接 / 测试草稿连接」（只读临时连接池 + 8s 超时 + 必定释放）以及全局只读 / 写审批 / 行数超时 / 敏感列脱敏护栏热更新保存；新增 `/api/dsh-sql/settings`（含旧回环 `/_dsh/dsh-sql/settings` 兼容）设置后端并保证接口永不回传明文密码，移除遗留无用产物 `lib/update-client.js`。
+- Fix DSH 0.2.2 host schema and `@deepseek-ai/schemastery@3.19.0` load/update failures (#4, #5): replace `type: ['string', 'null']` arrays in `sql_schema` outputs with `oneOf`, remove unsupported `minimum` keyword on `sql_query.parameters.properties.limit`, remove conflicting `.step(...)` constraints on `maxRows`/`queryTimeoutMs`/`execTimeoutMs`/`port` that rejected default `{ maxRows: 1000 }`, add host contract tests (`test/host-contract.test.mjs`), and ship a native bilingual visual Database Settings panel across all 3 official DSH slots (`settings.section`, `settings.plugins.tab`, `plugins.bundle.config`) backed by `/api/dsh-sql/settings` with zero-plaintext-secret responses, one-click live connectivity tests, custom multi-line PEM TLS support, and live-reloading guardrails.
+
 ## 0.8.0 (2026-11-22)
 
 - 写审批卡全面强化：`sql_exec` 审批卡现在完整展示参数化绑定值 `params`（PostgreSQL `$1=...` / SQLite & MySQL `[1]=...`），并由 `analyzeWriteRisks` 自动识别高危语句（`DROP`、`TRUNCATE`、无顶层 `WHERE` 的 `DELETE`/`UPDATE`，穿透 CTE 与子查询）在顶部标出 `⚠️ 高危提示`；未知连接名在审批前直接拒绝，只读配置下即使关闭 `writeApproval` 也于门控层一致拒绝。

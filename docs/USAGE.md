@@ -6,10 +6,11 @@
 
 ### 第 1 步：添加你的数据库连接（保存即生效）
 
-**方式 A（推荐）：DSH 原生设置面板**
+**方式 A（推荐）：DSH 可视化数据库设置面板**
 
-打开 **DSH → 设置 → 插件 → 数据库（`dsh-sql`）**：
-- 在 `connections` 添加一条或多条连接（支持 `sqlite`、`mysql`、`postgres`），既可分字段填写，也可在 `url` 中直接粘贴连接 URI（`postgres://` / `postgresql://` / `mysql://` / `sqlite:` / `file:`，支持 `?sslmode=` / `?ssl=`，显式字段优先）；`password` 字段自动脱敏，保存后**立即生效、无需重启**；
+打开 **DSH → 设置 → 数据库**（也可从 **设置 → 内置插件 → 数据库** 或 **插件 → 数据库** 进入）：
+- 可视化添加、编辑、删除一条或多条连接（支持 `sqlite`、`mysql`、`postgres`），既可分字段填写，也可在 `url` 中直接粘贴连接 URI（`postgres://` / `postgresql://` / `mysql://` / `sqlite:` / `file:`，支持 `?sslmode=` / `?ssl=`，显式字段优先）；
+- 支持一键点击 **测试连接** / **测试草稿连接** 实时验证连通性、耗时与表数量；`password` 字段自动脱敏（编辑时留空自动保留已存密码，也可勾选清除），保存后**立即生效、无需重启**；
 - 云数据库可在单连接上配置 `ssl`（原生设置与 `cordis.patch.yml` 均支持 `disable` / `allow` / `prefer` / `require` / `verify-ca` / `verify-full`、布尔值与 `{ rejectUnauthorized, ca }`；`ca` 支持 PEM 原文或本地证书文件路径，路径不存在时直接报明确错误）；
 - 如果部分连接是生产环境只读备库，既可开启全局 `readOnly`，也可仅在单条连接上勾选 `readOnly`，从插件、审批门与驱动层多重禁用写入；
 - 如需防止查询结果把敏感字段直接暴露给模型，可开启热更新配置 `redactColumns`（默认 `false` 关闭；设为 `true` 启用内置密码/密钥/Token 脱敏规则，或传入自定义列名子串与 `/正则/` 数组，命中的非空单元格统一替换为 `[REDACTED]`）。
@@ -78,10 +79,10 @@
 
 | 现象 | 常见原因 | 一步修复 |
 | :--- | :--- | :--- |
-| 只看到 `default（sqlite @ :memory:）` 且无表 | 还没添加自己的数据库连接 | 打开 **DSH「设置 → 插件 → 数据库」**添加 `connections` 并保存（立即生效） |
+| 只看到 `default（sqlite @ :memory:）` 且无表 | 还没添加自己的数据库连接 | 打开 **DSH「设置 → 数据库」**（或「设置 → 内置插件 → 数据库」/「插件 → 数据库」）添加连接、测试连通性并保存（立即生效） |
 | `ECONNREFUSED` / `ETIMEDOUT` | 数据库未启动、`host`/`port` 填错或被防火墙拦截 | 核对服务与端口，跨内网慢查询可适当调大 `queryTimeoutMs` |
 | TLS/SSL 握手或加密校验失败（`self-signed` / `certificate` / `no encryption` / `SSL CA 证书文件不存在` 等） | 云数据库要求 TLS 加密、自签名证书未通过校验，或 `ssl.ca` 文件路径不存在 | 在连接配置中设置 `ssl` 或 `url` `?sslmode=`：支持 `"disable"` / `"allow"` / `"prefer"` / `"require"` / `"verify-ca"` / `"verify-full"`（云库常用 `require` / `verify-ca` / `verify-full`）；自签名证书可用 `{ rejectUnauthorized: false }` 或提供存在的 `ca` 文件路径 / PEM 证书原文；仅本地可信网络设 `"disable"` |
-| `Access denied` / `password authentication failed` | 用户名或密码不对 | 在「设置 → 插件 → 数据库」核对 `user`/`password`，或检查环境变量 `DSH_SQL_PASSWORD_<连接名大写>` |
+| `Access denied` / `password authentication failed` | 用户名或密码不对 | 在「**设置 → 数据库**」核对 `user`/`password` 并点击「测试连接」验证，或检查环境变量 `DSH_SQL_PASSWORD_<连接名大写>` |
 | `Unknown database` / `database "…" does not exist` | `database` 库名拼错或尚未创建 | 核对连接配置里的 `database` 字段 |
 | `SQLITE_CANTOPEN` | SQLite 路径不存在或进程无读写权限 | 检查文件路径与所在目录权限 |
 | `no such table` / `relation "…" does not exist` | 表名大小写或 Schema 不匹配 | 让助手先不带 `table`/`tables` 调用 `sql_schema`（可配合 `schema` / `pattern` 过滤，PostgreSQL 含物化视图）获取真实表名 |

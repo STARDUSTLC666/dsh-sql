@@ -6,10 +6,11 @@
 
 ### Step 1: Add Your Database Connection (Applies Live)
 
-**Option A (Recommended): Native DSH Settings Form**
+**Option A (Recommended): Visual DSH Settings Panel**
 
-Open **DSH → Settings → Plugins → SQL (`dsh-sql`)**:
-- Add one or more entries under `connections` (`sqlite`, `mysql`, or `postgres`) — fill individual fields or paste a connection URI via `url` (`postgres://` / `postgresql://` / `mysql://` / `sqlite:` / `file:`, including `?sslmode=` / `?ssl=`, with explicit fields taking precedence); `password` fields are secret-masked and **changes take effect immediately on save without restarting DSH**;
+Open **DSH → Settings → SQL Databases** (also accessible from **Settings → Built-in Plugins → SQL** or **Plugins → SQL**):
+- Visually add, edit, and remove one or more connections (`sqlite`, `mysql`, or `postgres`) — fill individual fields or paste a connection URI via `url` (`postgres://` / `postgresql://` / `mysql://` / `sqlite:` / `file:`, including `?sslmode=` / `?ssl=`, with explicit fields taking precedence);
+- Use one-click **Test** / **Test draft** to check connectivity, latency, and table count before saving; `password` fields are secret-masked (left blank on edit preserves the stored password, with an optional clear checkbox) and **changes take effect immediately on save without restarting DSH**;
 - For cloud databases, set `ssl` per connection (both Settings and `cordis.patch.yml` support `disable` / `allow` / `prefer` / `require` / `verify-ca` / `verify-full`, booleans, and `{ rejectUnauthorized, ca }`; `ca` accepts PEM text or a local certificate file path, failing fast with an explicit error if the file does not exist);
 - For production replicas, turn on `readOnly` globally or per connection to block writes across the plugin, approval gate, and database driver;
 - To keep sensitive fields from reaching the model, enable live-reloadable `redactColumns` (`false` by default; `true` enables built-in password/secret/token patterns, or pass custom column substrings and `/regex/` patterns to mask non-null cells to `[REDACTED]`).
@@ -78,10 +79,10 @@ Run `sql_health` first (pings each connection, checks approval readiness, and at
 
 | Symptom | Usual Cause | Quick Fix |
 | :--- | :--- | :--- |
-| Only `default (sqlite @ :memory:)` appears | No external connection configured yet | Add your database under `connections` in **DSH Settings → Plugins → SQL** (applies live) |
+| Only `default (sqlite @ :memory:)` appears | No external connection configured yet | Add your database in **DSH Settings → SQL Databases** (or **Settings → Built-in Plugins → SQL** / **Plugins → SQL**), test it, and save (applies live) |
 | `ECONNREFUSED` / `ETIMEDOUT` | Server stopped, wrong `host`/`port`, or firewall | Verify server status and `host`/`port`; raise `queryTimeoutMs` for slow networks |
 | TLS/SSL handshake or certificate error (`self-signed` / `certificate` / `no encryption` / missing CA file) | Cloud DB requires TLS, self-signed cert failed verification, or `ssl.ca` path does not exist | Set `ssl` or `url` `?sslmode=`: supports `"disable"` / `"allow"` / `"prefer"` / `"require"` / `"verify-ca"` / `"verify-full"` (`require` / `verify-ca` / `verify-full` for cloud DBs); `{ rejectUnauthorized: false }` or an existing `ca` file path / PEM text for self-signed certs; `"disable"` only on trusted local networks |
-| `Access denied` / `password authentication failed` | Wrong username or password | Update `user`/`password` in Settings or set `DSH_SQL_PASSWORD_<NAME_UPPER>` |
+| `Access denied` / `password authentication failed` | Wrong username or password | Update `user`/`password` in **Settings → SQL Databases** (verify with **Test**) or set `DSH_SQL_PASSWORD_<NAME_UPPER>` |
 | `Unknown database` / `database "…" does not exist` | Typo in `database` or DB not created | Check the `database` field in your connection config |
 | `SQLITE_CANTOPEN` | Missing file path or directory permissions | Check the SQLite path and read/write permissions |
 | `no such table` / `relation "…" does not exist` | Table name case or schema mismatch | Call `sql_schema` without `table`/`tables` (optionally with `schema` / `pattern`; PostgreSQL includes materialized views) first to list exact table names |

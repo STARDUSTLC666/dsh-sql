@@ -640,3 +640,67 @@ test('host-config：Config 校验 redactColumns 与扩展 ssl 模式并支持 vo
     )
   }
 })
+
+test('host-config：移除非对齐 step 约束后接受常见数值，且 z.number().step() 与真实 schemastery@3.19.0 行为一致', () => {
+  assert.equal(Config.dict.maxRows.meta.step, undefined)
+  assert.equal(Config.dict.queryTimeoutMs.meta.step, undefined)
+  assert.equal(Config.dict.execTimeoutMs.meta.step, undefined)
+  assert.equal(Config.dict.connections.inner.dict.port.meta.step, undefined)
+
+  const empty = Config({})
+  assert.equal(empty.maxRows.get(), 1000)
+  assert.equal(empty.queryTimeoutMs.get(), 60000)
+  assert.equal(empty.execTimeoutMs.get(), 120000)
+
+  const patchDefault = Config({ maxRows: 1000 })
+  assert.equal(patchDefault.maxRows.get(), 1000)
+
+  const nonStepValues = Config({ maxRows: 50, queryTimeoutMs: 7500, execTimeoutMs: 12500 })
+  assert.equal(nonStepValues.maxRows.get(), 50)
+  assert.equal(nonStepValues.queryTimeoutMs.get(), 7500)
+  assert.equal(nonStepValues.execTimeoutMs.get(), 12500)
+
+  const minBounds = Config({ maxRows: 1, queryTimeoutMs: 5000, execTimeoutMs: 5000 })
+  assert.equal(minBounds.maxRows.get(), 1)
+  assert.equal(minBounds.queryTimeoutMs.get(), 5000)
+  assert.equal(minBounds.execTimeoutMs.get(), 5000)
+
+  // 校验 step 规则：(data - (meta.min ?? 0)) % step === 0（复现并锁死真实 @deepseek-ai/schemastery@3.19.0 语义）
+  const brokenMaxRows = z.object({
+    maxRows: z.number().min(1).max(10000).step(100).default(1000),
+  })
+  assert.throws(
+    () => brokenMaxRows({}),
+    (err) => err instanceof HostValidationError && /expected number multiple of 100 but got 1000/.test(err.message),
+  )
+  assert.throws(
+    () => brokenMaxRows({ maxRows: 1000 }),
+    (err) => err instanceof HostValidationError && /expected number multiple of 100 but got 1000/.test(err.message),
+  )
+  assert.equal(brokenMaxRows({ maxRows: 1 }).maxRows, 1)
+  assert.equal(brokenMaxRows({ maxRows: 101 }).maxRows, 101)
+
+  const timeoutStep = z.number().min(5000).max(600000).step(1000)
+  assert.equal(timeoutStep(60000), 60000)
+  assert.throws(
+    () => timeoutStep(7500),
+    (err) => err instanceof HostValidationError && /expected number multiple of 1000 but got 7500/.test(err.message),
+  )
+
+  // 无 min 时基准为 0；小数 step 使用十进制移位避免浮点误差
+  const noMinStep = z.number().step(5)
+  assert.equal(noMinStep(0), 0)
+  assert.equal(noMinStep(15), 15)
+  assert.equal(noMinStep(-10), -10)
+  assert.throws(() => noMinStep(7), HostValidationError)
+
+  const percent = z.number().min(0).max(1).step(0.01)
+  assert.equal(percent(0), 0)
+  assert.equal(percent(0.01), 0.01)
+  assert.equal(percent(0.3), 0.3)
+  assert.equal(percent(1), 1)
+  assert.throws(
+    () => percent(0.015),
+    (err) => err instanceof HostValidationError && /expected number multiple of 0\.01 but got 0\.015/.test(err.message),
+  )
+})

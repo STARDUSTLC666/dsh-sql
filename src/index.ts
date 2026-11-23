@@ -14,6 +14,11 @@ import { resolveConfig, type SqlConfig, type SqlConnectionConfig } from './confi
 import { Config as SqlConfigSchema, liveConfig } from './host-config.js'
 import { buildSqlTools, summarizeWriteScript, type SqlToolDefinition } from './tools.js'
 import { approvalPolicy, approvalProblem, type ApprovalContext } from './approval.js'
+import {
+  createSqlSettingsBackend,
+  installSqlSettingsWeb,
+  type SqlHostSettingsProvider,
+} from './web.js'
 
 /** cordis 服务注入：apply 里要用 ctx.tools，必须显式声明。 */
 export const Config = SqlConfigSchema
@@ -41,7 +46,10 @@ type SqlPreExecuteListener = (
 /** 插件所需的最小 ctx 面。 */
 export interface SqlPluginContext extends ApprovalContext {
   tools: { register(definition: SqlToolDefinition): () => void }
-  effect?(effect: () => () => unknown, label?: string): unknown
+  fiber?: { entry?: { options?: { id?: string } } }
+  settings?: unknown
+  inject?(deps: readonly string[], callback: (ctx: any) => void): unknown
+  effect?(effect: () => (() => unknown) | void, label?: string): unknown
   on(event: 'tools/pre-execute', listener: SqlPreExecuteListener): () => void
   on(event: 'dispose', listener: () => void): () => void
 }
@@ -117,6 +125,44 @@ export function apply(ctx: SqlPluginContext, config?: SqlConfig | null): void {
   const { tools, adapters } = buildSqlTools(getCfg, policyOf)
 
   const disposers: Array<() => void> = []
+  let injectedSettingsProvider: SqlHostSettingsProvider | undefined
+  if (typeof ctx.inject === 'function') {
+    try {
+      const offSettings = ctx.inject(['settings'], (sCtx: any) => {
+        const provider = sCtx?.settings as SqlHostSettingsProvider | undefined
+        if (provider !== undefined && provider !== null) {
+          injectedSettingsProvider = provider
+          if (typeof sCtx.effect === 'function') {
+            sCtx.effect(() => () => {
+              if (injectedSettingsProvider === provider) injectedSettingsProvider = undefined
+            }, 'dsh-sql: settings provider')
+          }
+        }
+        if (typeof provider?.configure === 'function') {
+          if (typeof sCtx.effect === 'function') {
+            sCtx.effect(() => {
+              const off = provider.configure!({ auto: false }, ctx.fiber)
+              return typeof off === 'function' ? off : undefined
+            }, 'dsh-sql: settings.configure')
+          } else {
+            const off = provider.configure({ auto: false }, ctx.fiber)
+            if (typeof off === 'function') disposers.push(off as () => void)
+          }
+        }
+      })
+      if (typeof offSettings === 'function') disposers.push(offSettings as () => void)
+      else if (offSettings !== null && typeof offSettings === 'object' && typeof (offSettings as { dispose?: unknown }).dispose === 'function') {
+        disposers.push(() => (offSettings as { dispose(): void }).dispose())
+      }
+    } catch {
+      // Older or minimal host without settings service; continue without custom settings hook.
+    }
+  }
+  const settingsBackend = createSqlSettingsBackend(ctx, live, {
+    getProvider: () => injectedSettingsProvider,
+  })
+  disposers.push(installSqlSettingsWeb(ctx, settingsBackend))
+
   // 始终注册 pre-execute 审批门，确保 writeApproval 从 false 热更新为 true 时立即生效。
   const offPreExecute = ctx.on('tools/pre-execute', async (exec, next) => {
     if (exec.name !== 'sql_exec') return next()
@@ -171,7 +217,7 @@ export function apply(ctx: SqlPluginContext, config?: SqlConfig | null): void {
     disposers.push(ctx.tools.register(definition))
   }
   const teardown = async () => {
-    for (const dispose of disposers) dispose()
+    for (const dispose of disposers.splice(0)) dispose()
     const active = [...adapters.values()]
     adapters.clear()
     await Promise.allSettled(active.map(adapter => adapter.close()))
@@ -187,3 +233,4 @@ export * from './adapters.js'
 export * from './config.js'
 export { liveConfig, createVolatile, HostValidationError, type HostSchemaNode, type HostSchemaMeta, type VolatileRef } from './host-config.js'
 export * from './tools.js'
+export * from './web.js'

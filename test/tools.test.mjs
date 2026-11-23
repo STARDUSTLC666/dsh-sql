@@ -62,7 +62,7 @@ test('构建 6 个工具且名字正确', () => {
   assert.deepEqual(tools.map((t) => t.name).sort(), ['sql_exec', 'sql_health', 'sql_list', 'sql_query', 'sql_schema', 'sql_stats'])
 })
 
-test('每个工具 schema 是 object JSON Schema，且保留 enum / items / minimum 约束', () => {
+test('每个工具 schema 符合宿主受限 JSON Schema 子集（保留 enum / items，不含 minimum / maximum，可空字段用 oneOf）', () => {
   for (const tool of tools) {
     assert.equal(tool.parameters.type, 'object')
     assert.equal(typeof tool.parameters.properties, 'object')
@@ -71,10 +71,17 @@ test('每个工具 schema 是 object JSON Schema，且保留 enum / items / mini
     assert.equal(typeof tool.execute, 'function')
   }
   assert.deepEqual(query.parameters.properties.format.enum, ['table', 'markdown', 'csv', 'json'])
-  assert.equal(query.parameters.properties.limit.minimum, 1)
+  assert.equal(query.parameters.properties.limit.type, 'integer')
+  assert.equal(Object.hasOwn(query.parameters.properties.limit, 'minimum'), false, 'DSH 宿主不支持 minimum 关键字')
+  assert.equal(Object.hasOwn(query.parameters.properties.limit, 'maximum'), false, 'DSH 宿主不支持 maximum 关键字')
   assert.deepEqual(query.parameters.properties.params.items, {})
   assert.deepEqual(exec.parameters.properties.params.items, {})
   assert.deepEqual(schema.parameters.properties.tables.items, { type: 'string' })
+  const nullableString = { oneOf: [{ type: 'string' }, { type: 'null' }] }
+  assert.deepEqual(schema.output.schema.properties.columns.items.properties.defaultValue, nullableString)
+  assert.deepEqual(schema.output.schema.properties.columns.items.properties.comment, nullableString)
+  assert.deepEqual(schema.output.schema.properties.tableDetails.items.properties.columns.items.properties.defaultValue, nullableString)
+  assert.deepEqual(schema.output.schema.properties.tableDetails.items.properties.columns.items.properties.comment, nullableString)
   assert.equal(typeof analyzeWriteRisks, 'function')
   assert.equal(typeof isCursorEligibleQuery, 'function')
   assert.equal(typeof toMarkdownTable, 'function')
@@ -122,6 +129,7 @@ test('sql_query 支持 limit、params 与参数化 sql_exec，拒绝非法 limit
 
   // 非法 limit / params / format
   await assert.rejects(() => query.execute({ sql: 'SELECT 1', limit: 0 }), /大于等于 1/)
+  await assert.rejects(() => query.execute({ sql: 'SELECT 1', limit: -1 }), /大于等于 1/)
   await assert.rejects(() => query.execute({ sql: 'SELECT 1', limit: 1.5 }), /大于等于 1/)
   await assert.rejects(() => query.execute({ sql: 'SELECT 1', params: 'bad' }), /params 必须是数组/)
   await assert.rejects(() => query.execute({ sql: 'SELECT 1', format: 'xml' }), /不支持的 format.*table \/ markdown \/ csv \/ json/)

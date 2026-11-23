@@ -1,6 +1,6 @@
 {
   "name": "dsh-sql",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "DeepSeek Harness 数据库插件：SQLite / MySQL / PostgreSQL 结构探查、限流查询与写操作审批。欢迎提交 issues 和 PR。",
   "type": "module",
   "main": "lib/index.js",
@@ -12,7 +12,7 @@
     },
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json",
-    "./client": "./lib/update-client.js",
+    "./client": "./lib/client.js",
     "./locale/*.json": "./locale/*.json",
     "./icon": "./assets/plugin-icon.webp"
   },
@@ -27,7 +27,7 @@
     "locale"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json && node scripts/build-updates.mjs",
+    "build": "tsc -p tsconfig.json && node scripts/build-client.mjs && node scripts/build-updates.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "npm run build && node --test \"test/*.test.mjs\"",
     "prepublishOnly": "npm run build"
@@ -38,7 +38,10 @@
       "patch": "./cordis.patch.yml"
     },
     "client": {
-      "platform": "web"
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
     }
   },
   "keywords": [
