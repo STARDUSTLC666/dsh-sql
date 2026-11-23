@@ -11,11 +11,17 @@
 #         - name: local
 #           engine: sqlite
 #           file: E:\data\app.db
-#       maxRows: 1000      # sql_query 返回行数上限（1-10000，默认 1000）
-#       queryTimeoutMs: 60000 # 单次查询超时（5 秒 - 10 分钟）
-#       execTimeoutMs: 120000 # 单次写操作超时（5 秒 - 10 分钟）
-#       readOnly: false    # true 时 sql_exec 被禁用
-#       writeApproval: true # 写操作先弹审批（默认 true）
+#         - name: prod
+#           engine: postgres
+#           url: postgres://readonly_user@db.internal:5432/app?sslmode=verify-full
+#           ssl: require       # disable / allow / prefer / require / verify-ca / verify-full / boolean / { rejectUnauthorized, ca }
+#           readOnly: true     # 单连接只读锁（仅禁止该连接写入）
+#       maxRows: 1000          # sql_query 返回行数上限（1-10000，默认 1000）
+#       queryTimeoutMs: 60000  # 单次查询超时（5 秒 - 10 分钟）
+#       execTimeoutMs: 120000  # 单次写操作超时（5 秒 - 10 分钟）
+#       readOnly: false        # true 时全局禁用 sql_exec
+#       writeApproval: true    # 写操作先弹审批（默认 true，热更新即刻生效）
+#       redactColumns: false   # true 启用内置敏感列脱敏，或传自定义列名/正则数组 -> [REDACTED]（热更新即刻生效）
 #
 - insert:
     - id: sql

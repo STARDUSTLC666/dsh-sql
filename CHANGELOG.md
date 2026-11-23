@@ -1,5 +1,10 @@
 # 更新记录
 
+## 0.9.1 (2026-11-23)
+
+- 更新 `cordis.patch.yml` 配置注释（补充 `url`、`ssl`、单连接 `readOnly` 与 `redactColumns`）以及中英文参考文档 `docs/REFERENCE.{zh,en}.md`（同步 v0.9.0 可视化设置面板、`redactColumns`、语言切换链接与兼容版本自动更新策略说明）。
+- Update `cordis.patch.yml` config comments (`url`, `ssl`, per-connection `readOnly`, `redactColumns`) and bilingual `docs/REFERENCE.{zh,en}.md` (v0.9.0 visual Settings panel, `redactColumns`, peer language links, and compatible minor+patch auto-update wording).
+
 ## 0.9.0 (2026-11-23)
 
 - 修复 DSH 0.2.2 宿主工具 Schema 校验触发回滚问题（#4、#5）：将 `sql_schema` 输出定义中的 4 处 `type: ['string', 'null']` 数组写法替换为宿主允许的 `oneOf: [{ type: 'string' }, { type: 'null' }]`，并移除 `sql_query.parameters.properties.limit` 上不被 `@deepseek-ai/dsh-tools` 支持的 `minimum` 约束关键字（继续保留运行时严格边界校验）。
