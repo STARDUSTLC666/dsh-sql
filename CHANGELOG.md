@@ -1,5 +1,10 @@
 # 更新记录
 
+## 0.9.2 (2026-11-25)
+
+- 修复数据库可视化设置表单多列对齐：为 `.dsh-sql-grid-2` 与 `.dsh-sql-grid-3` 补充 `align-items: start`，避免相邻字段带提示或清除密码勾选项时纵向拉伸错位。
+- Fix multi-column alignment in the visual Database Settings form by adding `align-items: start` to `.dsh-sql-grid-2` and `.dsh-sql-grid-3` so adjacent inputs stay top-aligned when hints or checkboxes appear.
+
 ## 0.9.1 (2026-11-23)
 
 - 更新 `cordis.patch.yml` 配置注释（补充 `url`、`ssl`、单连接 `readOnly` 与 `redactColumns`）以及中英文参考文档 `docs/REFERENCE.{zh,en}.md`（同步 v0.9.0 可视化设置面板、`redactColumns`、语言切换链接与兼容版本自动更新策略说明）。

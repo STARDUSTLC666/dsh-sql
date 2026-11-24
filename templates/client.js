@@ -866,11 +866,13 @@ window.__ModuleLoader__.load({
 .dsh-sql-grid-2 {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  align-items: start;
   gap: 12px;
 }
 .dsh-sql-grid-3 {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  align-items: start;
   gap: 12px;
 }
 .dsh-sql-field {
