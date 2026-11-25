@@ -1,5 +1,14 @@
 # 更新记录
 
+## 0.9.3 (2026-11-25)
+
+- SQLite 数据库操作移到持久子进程，超时和宿主取消能真正终止长查询并等待进程退出，避免阻塞宿主；连接内请求串行，单独取消排队请求不会中断其他操作。
+- 中断后不自动重放旧会话的排队写操作；文件库可重开并保留已提交数据，内存库明确失效。中断写操作提示结果可能已提交，核对后再重试。
+- 隔离 MySQL/PostgreSQL 的会话变量、默认库、临时表、会话设置与建议锁，避免状态污染连接池；SQLite 失败显式事务只回滚本次脚本开启的事务。
+- Move SQLite operations into a persistent child process so timeouts and host cancellation stop real native queries and await process exit without blocking the host. Serialize each connection and isolate cancellation of queued requests.
+- Do not replay queued writes after a session reset. Reopen file databases with committed data intact, explicitly invalidate interrupted memory databases, and preserve uncertain-write warnings so callers verify outcomes before retrying.
+- Discard pooled MySQL/PostgreSQL connections after session-state changes, including default databases, variables, temporary objects and advisory locks; roll back failed SQLite scripts without rolling back a pre-existing caller transaction.
+
 ## 0.9.2 (2026-11-25)
 
 - 修复数据库可视化设置表单多列对齐：为 `.dsh-sql-grid-2` 与 `.dsh-sql-grid-3` 补充 `align-items: start`，避免相邻字段带提示或清除密码勾选项时纵向拉伸错位。
