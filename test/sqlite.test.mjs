@@ -69,6 +69,36 @@ test('SQLite：exec 字符串含分号与多语句 DML 返回准确变更行数�
   assert.equal(await adapter.exec('  -- comment only\n ; '), 0)
 })
 
+test('SQLite：显式事务脚本失败时回滚本脚本打开的事务', async () => {
+  const mem = createAdapter({ name: 'explicit-tx-failure', engine: 'sqlite', file: ':memory:' })
+  try {
+    await mem.exec('CREATE TABLE tx_items (id INTEGER PRIMARY KEY)')
+    await assert.rejects(() => mem.exec(
+      'BEGIN; INSERT INTO tx_items VALUES (1); INSERT INTO missing_table VALUES (2)',
+    ))
+    assert.deepEqual(await mem.query('SELECT id FROM tx_items'), { columns: ['id'], rows: [] })
+    assert.equal(mem.db.isTransaction, false)
+  } finally {
+    await mem.close()
+  }
+})
+
+test('SQLite：多语句失败不回滚调用前已打开的事务', async () => {
+  const mem = createAdapter({ name: 'existing-tx-failure', engine: 'sqlite', file: ':memory:' })
+  try {
+    await mem.exec('CREATE TABLE tx_items (id INTEGER PRIMARY KEY)')
+    await mem.exec('BEGIN')
+    await mem.exec('INSERT INTO tx_items VALUES (1)')
+    await assert.rejects(mem.exec('INSERT INTO tx_items VALUES (2); INSERT INTO missing_table VALUES (3)'))
+    assert.equal(mem.db.isTransaction, true)
+    assert.deepEqual((await mem.query('SELECT id FROM tx_items ORDER BY id')).rows, [[1], [2]])
+    await mem.exec('ROLLBACK')
+    assert.deepEqual((await mem.query('SELECT id FROM tx_items')).rows, [])
+  } finally {
+    await mem.close()
+  }
+})
+
 test('SQLite：query(limit) 只迭代前 N 行，不全量载入', async () => {
   const capped = await adapter.query('SELECT id, name FROM users ORDER BY id', 1)
   assert.deepEqual(capped.columns, ['id', 'name'])

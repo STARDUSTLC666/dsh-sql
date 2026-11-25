@@ -86,6 +86,8 @@ const INLINE_BLOB_MAX_BYTES = 64
 const BLOB_PREVIEW_BYTES = 16
 const SQLITE_TX_OR_PRAGMA = /\b(?:begin|commit|end\s+transaction|rollback|savepoint|pragma|vacuum)\b/i
 const MYSQL_TX_CONTROL = /\b(?:begin|start\s+transaction|commit|rollback|savepoint|release\s+savepoint|lock\s+tables|unlock\s+tables|set\s+(?:session\s+|local\s+)?autocommit)\b/i
+const MYSQL_SESSION_STATE = /^(?:begin|start\s+transaction|commit|rollback|savepoint|release\s+savepoint|set|use|lock\s+tables|unlock\s+tables|prepare|deallocate\s+prepare|create\s+temporary\s+table|drop\s+temporary\s+table)\b/i
+const POSTGRES_SESSION_STATE = /^(?:begin|start\s+transaction|commit|end|rollback|savepoint|release\s+savepoint|set|reset|discard|prepare|deallocate|listen|unlisten|notify|create\s+(?:temp|temporary)\s+(?:table|view|sequence)|drop\s+(?:temp|temporary)\s+(?:table|view|sequence))\b/i
 
 let mysqlModule: typeof mysql | undefined
 let mysqlModulePromise: Promise<typeof mysql> | undefined
@@ -216,8 +218,26 @@ function hasSqliteTxOrPragma(sql: string): boolean {
   return SQLITE_TX_OR_PRAGMA.test(stripSqlNoise(sql, 'sqlite'))
 }
 
+function hasMysqlSessionState(sql: string): boolean {
+  return splitSqlStatements(sql, 'mysql').some(statement => {
+    const stripped = stripSqlNoise(statement, 'mysql').trim()
+    return MYSQL_SESSION_STATE.test(stripped)
+      || /:=/.test(stripped)
+      || /\b(?:get_lock|release_lock|release_all_locks|last_insert_id)\s*\(/i.test(stripped)
+  })
+}
+
 function hasMysqlTxControl(sql: string): boolean {
   return MYSQL_TX_CONTROL.test(stripSqlNoise(sql, 'mysql'))
+}
+
+function hasPostgresSessionState(sql: string): boolean {
+  return splitSqlStatements(sql, 'postgres').some(statement => {
+    const stripped = stripSqlNoise(statement, 'postgres').trim()
+    return POSTGRES_SESSION_STATE.test(stripped)
+      || /\bset_config\s*\(/i.test(stripped)
+      || /\bpg_(?:try_)?advisory_(?:lock|lock_shared|unlock|unlock_shared|unlock_all)\s*\(/i.test(stripped)
+  })
 }
 
 function resolveCaValue(ca: string): string {
@@ -529,12 +549,13 @@ class SqliteAdapter implements DatabaseAdapter {
     }
     const before = this.totalChanges()
     const wrapTx = !hasSqliteTxOrPragma(sql) && (this.db as { isTransaction?: boolean }).isTransaction !== true
+    const alreadyInTransaction = (this.db as { isTransaction?: boolean }).isTransaction === true
     if (wrapTx) this.db.exec('BEGIN')
     try {
       this.db.exec(sql)
       if (wrapTx) this.db.exec('COMMIT')
     } catch (error) {
-      if (wrapTx) {
+      if (wrapTx || (!alreadyInTransaction && (this.db as { isTransaction?: boolean }).isTransaction === true)) {
         try { this.db.exec('ROLLBACK') } catch {}
       }
       throw error
@@ -740,16 +761,20 @@ class MysqlAdapter implements DatabaseAdapter {
     const params = options?.params
     const timeout = validTimeoutMs(options?.timeoutMs)
     return await this.withReadOnlyConnection(signal, async (connection, discard) => {
-      if (limit === undefined || limit <= 0) {
-        const queryOpts: mysql.QueryOptions = { sql, rowsAsArray: true }
-        if (params !== undefined && params.length > 0) queryOpts.values = params as mysql.QueryValues
-        if (timeout !== undefined) queryOpts.timeout = timeout
-        const [rows, fields] = await connection.query(queryOpts) as [any[], any[]]
-        if (fields?.length) return { columns: fields.map(field => field.name as string), rows: rows.map(row => Array.isArray(row) ? row.map(toValue) : fields.map(field => toValue(row[field.name]))) }
-        return rowsToColumns(rows)
+      try {
+        if (limit === undefined || limit <= 0) {
+          const queryOpts: mysql.QueryOptions = { sql, rowsAsArray: true }
+          if (params !== undefined && params.length > 0) queryOpts.values = params as mysql.QueryValues
+          if (timeout !== undefined) queryOpts.timeout = timeout
+          const [rows, fields] = await connection.query(queryOpts) as [any[], any[]]
+          if (fields?.length) return { columns: fields.map(field => field.name as string), rows: rows.map(row => Array.isArray(row) ? row.map(toValue) : fields.map(field => toValue(row[field.name]))) }
+          return rowsToColumns(rows)
+        }
+        const coreConnection = (connection as unknown as { connection: { query(querySql: mysql.QueryOptions): any } }).connection
+        return await streamMysqlQuery(coreConnection, sql, limit, discard, params, timeout)
+      } finally {
+        if (hasMysqlSessionState(sql)) discard()
       }
-      const coreConnection = (connection as unknown as { connection: { query(querySql: mysql.QueryOptions): any } }).connection
-      return await streamMysqlQuery(coreConnection, sql, limit, discard, params, timeout)
     })
   }
   async exec(sql: string, signal?: AbortSignal, options?: ExecOptions) {
@@ -759,19 +784,40 @@ class MysqlAdapter implements DatabaseAdapter {
     if (stmts.length === 0) return 0
     const params = options?.params
     const timeout = validTimeoutMs(options?.timeoutMs)
+    const containsSessionState = hasMysqlSessionState(sql)
     if (params !== undefined && params.length > 0) {
       if (stmts.length > 1) {
         throw new Error('带参数（params）的 sql_exec 仅支持单条语句。')
       }
       const queryOpts: mysql.QueryOptions = { sql: stmts[0], values: params as mysql.QueryValues }
       if (timeout !== undefined) queryOpts.timeout = timeout
-      const [result] = await this.queryRows(queryOpts, signal) as unknown as [{ affectedRows?: number }, unknown]
+      const [result] = containsSessionState
+        ? await this.withSignalConnection(signal, async (connection, discard) => {
+          try {
+            return await connection.query(queryOpts) as unknown as [{ affectedRows?: number }, unknown]
+          } finally {
+            discard()
+          }
+        })
+        : await this.queryRows(queryOpts, signal) as unknown as [{ affectedRows?: number }, unknown]
       return Number(result?.affectedRows ?? 0)
     }
     if (stmts.length === 1) {
       const queryArg: string | mysql.QueryOptions = timeout !== undefined ? { sql: stmts[0], timeout } : stmts[0]
-      const [result] = await this.queryRows(queryArg, signal) as unknown as [{ affectedRows?: number }, unknown]
-      return Number(result?.affectedRows ?? 0)
+      if (!containsSessionState) {
+        const [result] = await this.queryRows(queryArg, signal) as unknown as [{ affectedRows?: number }, unknown]
+        return Number(result?.affectedRows ?? 0)
+      }
+      return await this.withSignalConnection(signal, async (connection, discard) => {
+        try {
+          const [result] = (typeof queryArg === 'string'
+            ? await connection.query(queryArg)
+            : await connection.query(queryArg)) as unknown as [{ affectedRows?: number }, unknown]
+          return Number(result?.affectedRows ?? 0)
+        } finally {
+          discard()
+        }
+      })
     }
     const wrapTx = !hasMysqlTxControl(sql)
     return await this.withSignalConnection(signal, async (connection, discard, isDiscarded) => {
@@ -803,9 +849,10 @@ class MysqlAdapter implements DatabaseAdapter {
         return total
       } catch (error) {
         hasPrimaryError = true
-        if (!wrapTx) discard()
+        if (containsSessionState) discard()
         throw error
       } finally {
+        if (containsSessionState) discard()
         if (inTransaction && !isDiscarded()) {
           try {
             await connection.query('ROLLBACK')
@@ -1116,45 +1163,50 @@ class PostgresAdapter implements DatabaseAdapter {
   }
   async query(sql: string, limit?: number, signal?: AbortSignal, options?: QueryOptions) {
     const params = options?.params
+    const isolateConnection = hasPostgresSessionState(sql)
     return await this.withReadOnlyClient(signal, options?.timeoutMs, async (client, discard, isDiscarded) => {
-      if (limit === undefined || limit <= 0) {
-        const queryConfig: pg.QueryArrayConfig & { queryMode: 'extended' } = {
-          text: sql,
-          rowMode: 'array',
-          queryMode: 'extended',
-        }
-        if (params !== undefined && params.length > 0) queryConfig.values = params
-        const result = await client.query(queryConfig)
-        return { columns: result.fields.map((field: { name: string }) => field.name), rows: result.rows.map((row: unknown[]) => row.map(toValue)) }
-      }
-      if (
-        options?.useCursor === true
-        && Number.isFinite(limit)
-        && Math.round(limit) > 0
-        && (params === undefined || params.length === 0)
-        && isCursorEligibleQuery(sql, 'postgres')
-      ) {
-        const stmts = splitSqlStatements(sql.trim(), 'postgres')
-        if (stmts.length === 1 && stmts[0] !== '') {
-          // Extended protocol still rejects multiple commands with 42601;
-          // outer ROLLBACK closes the cursor and lets the pooled connection be reused cleanly.
-          await client.query({
-            text: 'DECLARE _dsh_cursor NO SCROLL CURSOR FOR ' + stmts[0],
-            queryMode: 'extended',
-          } as pg.QueryConfig)
-          signal?.throwIfAborted()
-          const fetched = await client.query({
-            text: 'FETCH ' + Math.round(limit) + ' FROM _dsh_cursor',
+      try {
+        if (limit === undefined || limit <= 0) {
+          const queryConfig: pg.QueryArrayConfig & { queryMode: 'extended' } = {
+            text: sql,
             rowMode: 'array',
             queryMode: 'extended',
-          } as pg.QueryArrayConfig)
-          return {
-            columns: fetched.fields.map((field: { name: string }) => field.name),
-            rows: fetched.rows.map((row: unknown[]) => row.map(toValue)),
+          }
+          if (params !== undefined && params.length > 0) queryConfig.values = params
+          const result = await client.query(queryConfig)
+          return { columns: result.fields.map((field: { name: string }) => field.name), rows: result.rows.map((row: unknown[]) => row.map(toValue)) }
+        }
+        if (
+          options?.useCursor === true
+          && Number.isFinite(limit)
+          && Math.round(limit) > 0
+          && (params === undefined || params.length === 0)
+          && isCursorEligibleQuery(sql, 'postgres')
+        ) {
+          const stmts = splitSqlStatements(sql.trim(), 'postgres')
+          if (stmts.length === 1 && stmts[0] !== '') {
+            // Extended protocol still rejects multiple commands with 42601;
+            // outer ROLLBACK closes the cursor and lets the pooled connection be reused cleanly.
+            await client.query({
+              text: 'DECLARE _dsh_cursor NO SCROLL CURSOR FOR ' + stmts[0],
+              queryMode: 'extended',
+            } as pg.QueryConfig)
+            signal?.throwIfAborted()
+            const fetched = await client.query({
+              text: 'FETCH ' + Math.round(limit) + ' FROM _dsh_cursor',
+              rowMode: 'array',
+              queryMode: 'extended',
+            } as pg.QueryArrayConfig)
+            return {
+              columns: fetched.fields.map((field: { name: string }) => field.name),
+              rows: fetched.rows.map((row: unknown[]) => row.map(toValue)),
+            }
           }
         }
+        return await streamPostgresQuery(client, sql, limit, discard, isDiscarded, params)
+      } finally {
+        if (isolateConnection) discard()
       }
-      return await streamPostgresQuery(client, sql, limit, discard, isDiscarded, params)
     })
   }
   async exec(sql: string, signal?: AbortSignal, options?: ExecOptions) {
@@ -1168,12 +1220,13 @@ class PostgresAdapter implements DatabaseAdapter {
     }
     const values = params !== undefined && params.length > 0 ? params : undefined
     const timeout = validTimeoutMs(options?.timeoutMs)
-    const result = timeout === undefined
+    const isolateConnection = stmts.length > 1 || hasPostgresSessionState(sql)
+    const result = timeout === undefined && !isolateConnection
       ? await this.queryWithSignal(sql, values, signal)
       : await this.withSignalClient(signal, async (client, discard, isDiscarded) => {
         let timeoutApplied = false
         let hasPrimaryError = false
-        try {
+        if (timeout !== undefined) {
           try {
             await client.query('SET statement_timeout = ' + timeout)
             timeoutApplied = true
@@ -1181,10 +1234,13 @@ class PostgresAdapter implements DatabaseAdapter {
             discard()
             throw error
           }
+        }
+        try {
           signal?.throwIfAborted()
           return values === undefined ? await client.query(sql) : await client.query(sql, values)
         } catch (error) {
           hasPrimaryError = true
+          if (isolateConnection) discard()
           throw error
         } finally {
           if (timeoutApplied && !isDiscarded()) {
@@ -1195,6 +1251,7 @@ class PostgresAdapter implements DatabaseAdapter {
               if (!hasPrimaryError) throw resetError
             }
           }
+          if (isolateConnection) discard()
         }
       })
     if (Array.isArray(result)) {

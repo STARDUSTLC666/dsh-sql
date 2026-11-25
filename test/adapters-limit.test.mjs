@@ -493,16 +493,163 @@ test('PostgreSQL：exec 多语句累加数组 rowCount、支持 params 并拦截
     async query(sql, values) {
       calls.push({ sql, values })
       if (values !== undefined) return { rowCount: 1 }
-      if (sql.includes(';')) return [{ rowCount: 1 }, { rowCount: 2 }, { rowCount: null }]
       return { rowCount: 4 }
+    },
+    async connect() {
+      return {
+        release(force) { calls.push({ release: force === true }) },
+        async query(query, values) {
+          const sql = typeof query === 'string' ? query : query.text
+          calls.push({ sql, values })
+          if (sql.includes(';')) return [{ rowCount: 1 }, { rowCount: 2 }, { rowCount: null }]
+          return { rowCount: 4 }
+        },
+      }
     },
   }
 
   assert.equal(await adapter.exec('INSERT INTO a VALUES (1); INSERT INTO a VALUES (2), (3); CREATE TEMP TABLE x(id INT)'), 3)
+  assert.deepEqual(calls[1], { release: true })
   assert.equal(await adapter.exec('UPDATE a SET v = $1 WHERE id = $2', undefined, { params: ['ok', 7] }), 1)
-  assert.deepEqual(calls[1], { sql: 'UPDATE a SET v = $1 WHERE id = $2', values: ['ok', 7] })
+  assert.deepEqual(calls[2], { sql: 'UPDATE a SET v = $1 WHERE id = $2', values: ['ok', 7] })
   await assert.rejects(() => adapter.exec('INSERT INTO a VALUES ($1); INSERT INTO a VALUES ($2)', undefined, { params: [1, 2] }), /仅支持单条语句/)
   assert.equal(await adapter.exec('/* comment only */ ;'), 0)
+})
+
+test('MySQL / PostgreSQL：会话状态与显式事务脚本使用专用连接并在结束后丢弃', async () => {
+  const mysqlAdapter = createAdapter({ name: 'my-session-state', engine: 'mysql', database: 'app' })
+  const mysqlCommands = []
+  const mysqlState = { released: false, destroyed: false }
+  mysqlAdapter.pool = {
+    async getConnection() {
+      return {
+        async query(query) {
+          const sql = typeof query === 'string' ? query : query.sql
+          mysqlCommands.push(sql)
+          return [{ affectedRows: 0 }, []]
+        },
+        release() { mysqlState.released = true },
+        destroy() { mysqlState.destroyed = true },
+      }
+    },
+  }
+  await mysqlAdapter.exec('SET @dsh_session_state = 1')
+  assert.deepEqual(mysqlCommands, ['SET @dsh_session_state = 1'])
+  assert.deepEqual(mysqlState, { released: false, destroyed: true })
+
+  const mysqlQuery = mysqlFixture([[1]])
+  await mysqlQuery.adapter.query('SELECT @dsh_session_state := 1')
+  assert.equal(mysqlQuery.state.destroyed, true, 'a session-variable assignment must not return a pooled connection')
+
+  const mysqlNamedLock = mysqlFixture([[1]])
+  await mysqlNamedLock.adapter.query("SELECT GET_LOCK('dsh-audit-lock', 0)")
+  assert.equal(mysqlNamedLock.state.destroyed, true, 'a named lock must not survive on a pooled connection')
+
+  const mysqlTemp = createAdapter({ name: 'my-temp-table', engine: 'mysql', database: 'app' })
+  const mysqlTempState = { released: false, destroyed: false }
+  mysqlTemp.pool = {
+    async getConnection() {
+      return {
+        async query() { return [{ affectedRows: 0 }, []] },
+        release() { mysqlTempState.released = true },
+        destroy() { mysqlTempState.destroyed = true },
+      }
+    },
+  }
+  await mysqlTemp.exec('CREATE TEMPORARY TABLE dsh_temp (id INT)')
+  assert.deepEqual(mysqlTempState, { released: false, destroyed: true })
+
+  const mysqlTempScript = createAdapter({ name: 'my-temp-script', engine: 'mysql', database: 'app' })
+  const mysqlScriptState = { released: false, destroyed: false }
+  mysqlTempScript.pool = {
+    async getConnection() {
+      return {
+        async query() { return [{ affectedRows: 0 }, []] },
+        release() { mysqlScriptState.released = true },
+        destroy() { mysqlScriptState.destroyed = true },
+      }
+    },
+  }
+  await mysqlTempScript.exec('CREATE TEMPORARY TABLE dsh_temp (id INT); INSERT INTO dsh_temp VALUES (1)')
+  assert.deepEqual(mysqlScriptState, { released: false, destroyed: true })
+
+  const pgAdapter = createAdapter({ name: 'pg-session-state', engine: 'postgres', database: 'app' })
+  const pgCommands = []
+  const pgReleases = []
+  pgAdapter.pool = {
+    async connect() {
+      return {
+        async query(query) {
+          const sql = typeof query === 'string' ? query : query.text
+          pgCommands.push(sql)
+          if (sql.includes('FAIL')) throw new Error('script failed')
+          return Array.isArray(query) ? query.map(() => ({ rowCount: 1 })) : { rowCount: 1 }
+        },
+        release(force) { pgReleases.push(force === true) },
+      }
+    },
+  }
+  await pgAdapter.exec('BEGIN; INSERT INTO t VALUES (1); COMMIT')
+  assert.deepEqual(pgReleases, [true])
+  await assert.rejects(pgAdapter.exec('BEGIN; INSERT INTO t VALUES (2); SELECT FAIL'), /script failed/)
+  assert.deepEqual(pgReleases, [true, true])
+  assert.deepEqual(pgCommands, [
+    'BEGIN; INSERT INTO t VALUES (1); COMMIT',
+    'BEGIN; INSERT INTO t VALUES (2); SELECT FAIL',
+  ])
+
+  const pgTemp = createAdapter({ name: 'pg-temp-table', engine: 'postgres', database: 'app' })
+  const pgTempReleases = []
+  pgTemp.pool = {
+    async connect() {
+      return {
+        async query() { return { rowCount: 0 } },
+        release(force) { pgTempReleases.push(force === true) },
+      }
+    },
+  }
+  await pgTemp.exec('CREATE TEMP TABLE dsh_temp (id INT)')
+  assert.deepEqual(pgTempReleases, [true])
+
+  const pgLock = pgFixture([[true]])
+  await pgLock.adapter.query('SELECT pg_advisory_lock(10, 20)')
+  assert.deepEqual(pgLock.state.released, [true], 'session-level advisory locks must not survive in a pooled connection')
+
+  const pgConfig = pgFixture([['public']])
+  await pgConfig.adapter.query("SELECT set_config('search_path', 'public', false)")
+  assert.deepEqual(pgConfig.state.released, [true], 'session-level settings must not survive in a pooled connection')
+})
+
+test('MySQL：USE 改变默认数据库后不把连接放回池中，失败时保留主错误', async () => {
+  for (const fail of [false, true]) {
+    const adapter = createAdapter({ name: 'my-use', engine: 'mysql', database: 'app' })
+    const state = { released: false, destroyed: false }
+    const query = async () => {
+      if (fail) throw new Error('database unavailable')
+      return [{ affectedRows: 0 }, []]
+    }
+    adapter.pool = {
+      query,
+      async getConnection() {
+        return {
+          query,
+          release() { state.released = true },
+          destroy() { state.destroyed = true },
+        }
+      },
+    }
+    if (fail) await assert.rejects(adapter.exec('USE reporting'), /database unavailable/)
+    else assert.equal(await adapter.exec('USE reporting'), 0)
+    assert.deepEqual(state, { released: false, destroyed: true })
+  }
+})
+
+test('PostgreSQL：try advisory locks 使用正确函数名识别并隔离查询连接', async () => {
+  for (const name of ['pg_try_advisory_lock', 'pg_try_advisory_lock_shared']) {
+    const fixture = pgFixture([[true]])
+    await fixture.adapter.query('SELECT ' + name + '(10, 20)')
+    assert.deepEqual(fixture.state.released, [true], name + ' must not survive in a pooled connection')
+  }
 })
 
 test('PostgreSQL：useCursor=true 走扩展协议 DECLARE/FETCH 并干净归还连接；EXPLAIN 与参数化回退流式', async () => {
@@ -633,7 +780,7 @@ test('PostgreSQL：exec 在提供 timeoutMs 时设置并重置 statement_timeout
   assert.equal(await okMulti.adapter.exec('INSERT INTO a VALUES (1); INSERT INTO b VALUES (2);', undefined, { timeoutMs: 12000 }), 5)
   assert.equal(okMulti.commands[0].sql, 'SET statement_timeout = 12000')
   assert.equal(okMulti.commands[2].sql, 'RESET statement_timeout')
-  assert.deepEqual(okMulti.released, [false])
+  assert.deepEqual(okMulti.released, [true])
 
   // SET statement_timeout 失败：销毁连接且不执行主语句或 RESET
   const badSet = makeExecFixture({ failSet: true })
@@ -649,7 +796,7 @@ test('PostgreSQL：exec 在提供 timeoutMs 时设置并重置 statement_timeout
   // 主语句失败且 RESET 也失败：销毁连接并保留主错误
   const bothFail = makeExecFixture({ failMain: true, failReset: true })
   await assert.rejects(() => bothFail.adapter.exec('BEGIN; INSERT INTO bad VALUES (1); COMMIT', undefined, { timeoutMs: 5000 }), /primary exec failed/)
-  assert.equal(bothFail.commands.at(-1).sql, 'RESET statement_timeout')
+  assert.equal(bothFail.commands.at(-1).sql, 'BEGIN; INSERT INTO bad VALUES (1); COMMIT')
   assert.deepEqual(bothFail.released, [true])
 })
 
