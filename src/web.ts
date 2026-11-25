@@ -1224,7 +1224,7 @@ export function createSqlSettingsBackend(
       }
     },
 
-    /** 由旧宿主 webServer（/_dsh/dsh-sql/settings）调用，额外强制本机回环校验。 */
+    /** 由已通过宿主连接认证的 webServer 包装器调用，额外强制本机回环校验。 */
     async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
       const controller = new AbortController()
       const onAbort = () => {
@@ -1313,11 +1313,35 @@ export function installSqlSettingsWeb(
       }
     }))
 
-    track(ctx.inject(['webServer'], (webCtx: any) => {
+    track(ctx.inject(['webServer', 'connection'], (webCtx: any) => {
+      const handleAuthenticated = (req: IncomingMessage, res: ServerResponse): Promise<void> | void => {
+        // Loopback and X-DSH-SQL protect the request origin; neither proves that
+        // the caller has authenticated to the host. Raw webServer routes bypass
+        // the /api connection pipeline, so run the same host verifier here.
+        let rejection: unknown = 403
+        try {
+          const connection = webCtx?.connection
+          if (typeof connection?.requestRejection === 'function') {
+            rejection = connection.requestRejection({ headers: req.headers ?? {} })
+          }
+        } catch {
+          // A missing or failing verifier must never fall back to loopback-only access.
+        }
+        if (rejection !== undefined) {
+          res.writeHead(rejection === 401 ? 401 : 403, {
+            'Content-Type': 'application/json; charset=utf-8',
+            'Cache-Control': 'no-store',
+            'X-Content-Type-Options': 'nosniff',
+          })
+          res.end(JSON.stringify({ error: '请先通过 DSH 宿主认证。', code: 'unauthorized' }))
+          return
+        }
+        return backend.handle(req, res)
+      }
       const mount = () => webCtx?.webServer?.register?.({
         kind: 'exact',
         path: SQL_SETTINGS_ROUTE,
-        handler: (req: IncomingMessage, res: ServerResponse) => backend.handle(req, res),
+        handler: handleAuthenticated,
       })
       if (typeof webCtx?.effect === 'function') {
         webCtx.effect(() => {

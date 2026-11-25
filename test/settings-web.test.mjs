@@ -419,6 +419,49 @@ test('removeConnection：大小写不敏感删除、404 未找到与清空后恢
   assert.notEqual(removed.body.snapshot.revision, rev0)
 })
 
+test('宿主描述符遮蔽 URI 后，三种持久化路径仍保留未编辑连接及改名连接的原凭据', async () => {
+  const url = 'postgres://alice:Encoded%40Secret%3A%2F%25@db.internal:5433/app?sslmode=verify-full'
+  for (const mode of ['mutate', 'update', 'replace']) {
+    const h = makeVolatileHarness({ connections: [{ name: 'uri', engine: 'postgres', url }] }, { mode })
+    const describe = h.provider.describe
+    h.provider.describe = () => describe().map(row => ({
+      ...row,
+      user: {
+        ...row.user,
+        connections: row.user.connections?.map(({ url: _url, password: _password, ...connection }) => connection),
+      },
+    }))
+    let snapshot = h.backend.snapshot()
+    const guards = await callApi(h.backend, 'POST', {
+      action: 'saveGuardrails', revision: snapshot.revision, maxRows: 50,
+    })
+    assert.equal(guards.status, 200, mode)
+    assert.equal(h.parsed.connections.get()[0].url, url, mode + ' guardrail save keeps raw URI')
+    snapshot = guards.body.snapshot
+    const added = await callApi(h.backend, 'POST', {
+      action: 'saveConnection', revision: snapshot.revision,
+      connection: { name: 'unrelated', engine: 'sqlite', file: ':memory:' },
+    })
+    assert.equal(added.status, 200, mode)
+    assert.equal(h.parsed.connections.get()[0].url, url, mode + ' unrelated save keeps raw URI')
+    const renamed = await callApi(h.backend, 'POST', {
+      action: 'saveConnection', revision: added.body.snapshot.revision, originalName: 'uri',
+      connection: {
+        name: 'renamed', engine: 'postgres', host: 'db.internal', port: 5433,
+        user: 'alice', database: 'app', ssl: 'verify-full', password: '',
+      },
+    })
+    assert.equal(renamed.status, 200, mode)
+    const stored = h.parsed.connections.get()[0]
+    assert.equal(stored.password, 'Encoded@Secret:/%', mode + ' rename preserves decoded password')
+    assert.equal(stored.url, undefined, mode)
+    assert.equal(stored.ssl, 'verify-full', mode)
+    for (const result of [guards, added, renamed]) {
+      assert.doesNotMatch(result.rawText, /Encoded|postgres:\/\//, mode + ' response remains secret-free')
+    }
+  }
+})
+
 test('testConnection：真实 SQLite :memory: / 文件库（含表数与句柄关闭）、不可达端口下一步提示、只读模式下可用与密码脱敏', async () => {
   const tempDir = mkdtempSync(join(tmpdir(), 'dsh-sql-web-test-'))
   const dbPath = join(tempDir, 'sample.db')
@@ -967,4 +1010,81 @@ test('installSqlSettingsWeb 与 apply() 注册双路由、关闭自动表单并�
   disposeStandalone()
   assert.equal(plainApi.length, 0)
   assert.equal(plainWeb.length, 0)
+})
+
+test('旧设置路由必须先通过宿主认证：伪造本机头不能读取、写入或测试数据库', async () => {
+  const h = makeVolatileHarness({
+    connections: [{ name: 'private-db', engine: 'mysql', url: 'mysql://user:PrivateAuthSecret@db.internal/private' }],
+  })
+  const routes = []
+  let verificationCalls = 0
+  const connection = {
+    requestRejection(request) {
+      verificationCalls += 1
+      return request.headers.cookie === 'dsh-session=valid' ? undefined : 401
+    },
+  }
+  const off = installSqlSettingsWeb({
+    inject(deps, cb) {
+      if (!deps.includes('webServer')) return
+      cb({
+        connection,
+        webServer: { register(route) { routes.push(route); return () => routes.splice(routes.indexOf(route), 1) } },
+      })
+    },
+  }, h.backend)
+  try {
+    const route = routes.find(item => item.path === SQL_SETTINGS_ROUTE)
+    assert.ok(route)
+    const mounted = { handle: route.handler }
+    const snapshot = h.backend.snapshot()
+    const revisionBefore = h.getRevision()
+    for (const options of [
+      {},
+      { headers: { origin: 'http://localhost:3080', 'sec-fetch-site': 'same-origin' } },
+      { method: 'POST', body: { action: 'saveGuardrails', revision: snapshot.revision, maxRows: 1 } },
+      { method: 'POST', body: { action: 'testConnection', name: 'private-db' } },
+      { method: 'POST', body: { action: 'removeConnection', name: 'private-db', revision: snapshot.revision } },
+    ]) {
+      const result = await callNodeHandle(mounted, options)
+      assert.equal(result.status, 401)
+      assert.equal(result.body.code, 'unauthorized')
+      assert.equal(result.body.snapshot, undefined)
+      assert.doesNotMatch(result.rawText, /private-db|db\.internal|PrivateAuthSecret/)
+    }
+    assert.equal(h.calls.length, 0)
+    assert.equal(h.getRevision(), revisionBefore)
+    assert.equal(verificationCalls, 5)
+
+    const authenticatedHeaders = { cookie: 'dsh-session=valid' }
+    const read = await callNodeHandle(mounted, { headers: authenticatedHeaders })
+    assert.equal(read.status, 200)
+    assert.equal(read.body.snapshot.connections[0].name, 'private-db')
+    assert.doesNotMatch(read.rawText, /PrivateAuthSecret|mysql:\/\//)
+    const saved = await callNodeHandle(mounted, {
+      method: 'POST', headers: authenticatedHeaders,
+      body: { action: 'saveGuardrails', revision: read.body.snapshot.revision, maxRows: 25 },
+    })
+    assert.equal(saved.status, 200)
+    assert.equal(saved.body.snapshot.guardrails.maxRows, 25)
+    assert.equal(h.calls.length, 1)
+
+    // Host authentication does not replace the request-origin guard.
+    const foreignOrigin = await callNodeHandle(mounted, {
+      headers: { ...authenticatedHeaders, origin: 'https://evil.example' },
+    })
+    assert.equal(foreignOrigin.status, 403)
+    assert.equal(foreignOrigin.body.snapshot, undefined)
+
+    for (const verifier of [undefined, () => { throw new Error('private-verifier-error') }, () => null, () => Promise.resolve(undefined)]) {
+      connection.requestRejection = verifier
+      const denied = await callNodeHandle(mounted, { headers: authenticatedHeaders })
+      assert.equal(denied.status, 403)
+      assert.equal(denied.body.snapshot, undefined)
+      assert.doesNotMatch(denied.rawText, /private-verifier-error|private-db|PrivateAuthSecret/)
+    }
+  } finally {
+    off()
+  }
+  assert.equal(routes.length, 0)
 })

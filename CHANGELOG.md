@@ -1,5 +1,10 @@
 # 更新记录
 
+## 0.9.4 (2026-11-25)
+
+- SQL 连接 URI 在通用设置描述和变更响应中标记为秘密字段；旧版 Web 设置路由现在先执行宿主认证，缺失或失败时拒绝请求，再执行原有来源校验。
+- Mark SQL connection URIs as secret in generic settings descriptions and mutation responses; authenticate legacy Web settings requests with the host before applying the existing request-origin checks, failing closed if authentication is unavailable.
+
 ## 0.9.3 (2026-11-25)
 
 - SQLite 数据库操作移到持久子进程，超时和宿主取消能真正终止长查询并等待进程退出，避免阻塞宿主；连接内请求串行，单独取消排队请求不会中断其他操作。

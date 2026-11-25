@@ -573,3 +573,21 @@ test('Config serialization has no incompatible step and validates {} and { maxRo
   assert.equal('issues' in stdPatch, false)
   assert.equal(stdPatch.value.maxRows.get(), 1000)
 })
+
+test('数据库 URI 与直接密码都标为宿主 secret，序列化后仍保留凭据和运行时解析语义', () => {
+  const serialized = JSON.parse(JSON.stringify(Config))
+  const connections = serialized.refs[serialized.refs[serialized.uid].dict.connections]
+  const row = serialized.refs[connections.inner]
+  assert.equal(serialized.refs[row.dict.url].meta.role, 'secret')
+  assert.equal(serialized.refs[row.dict.password].meta.role, 'secret')
+
+  const url = 'postgres://alice:P%40ss%3Aword%2F%25@db.internal:5433/app?sslmode=verify-full'
+  const config = liveConfig(Config({ connections: [{ name: 'uri', engine: 'postgres', url }] }))
+  assert.equal(config.connections[0].url, url)
+  const resolved = resolveConfig(config, {}).connections[0]
+  assert.equal(resolved.password, 'P@ss:word/%')
+  assert.equal(resolved.host, 'db.internal')
+  assert.equal(resolved.port, 5433)
+  assert.equal(resolved.database, 'app')
+  assert.equal(resolved.ssl, 'verify-full')
+})
