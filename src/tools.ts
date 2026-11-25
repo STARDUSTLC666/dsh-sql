@@ -586,11 +586,14 @@ export function buildSqlTools(
     return { adapter, name: connection.name, cfg, connection }
   }
 
-  /** 适配器调用统一兜底：外部取消信号触发时原样抛出，其余错误（含超时）补「下一步」。 */
+  /** 保留写入结果不确定的提示；普通取消原样抛出，其余错误补「下一步」。 */
   const guard = async <T>(outerSignal: AbortSignal | undefined, work: () => Promise<T>): Promise<T> => {
     try {
       return await work()
     } catch (error) {
+      // A cancelled write can already have committed. Keep its outcome warning and
+      // cancellation cause instead of replacing them with the caller's bare reason.
+      if (typeof error === 'object' && error !== null && (error as { sqliteOutcome?: unknown }).sqliteOutcome === 'unknown') throw error
       outerSignal?.throwIfAborted()
       throw annotateError(error)
     }

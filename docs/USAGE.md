@@ -39,7 +39,7 @@
         url: mysql://root@127.0.0.1:3306/legacy
         ssl: disable                  # 本地可信网络可关闭；云库建议 require / verify-ca / verify-full
     maxRows: 1000                     # 单次只读查询返回行数上限（1–10000）
-    queryTimeoutMs: 60000             # 单次查询超时（默认 60 秒，同步下发服务端超时）
+    queryTimeoutMs: 60000             # 单次查询超时（默认 60 秒）
     execTimeoutMs: 120000             # 单次写操作超时（默认 120 秒，PostgreSQL/MySQL 同步下发服务端超时）
     readOnly: false                   # true 时全局禁用 sql_exec（也可在单连接设置 readOnly）
     writeApproval: true               # 写操作前弹审批卡（默认 true，热更新即刻生效）
@@ -107,7 +107,8 @@
 ### 关键数据、安全与运行细节
 
 - **引擎级只读纵深防御与 PostgreSQL 游标复用**：除词法白名单外，SQLite 连接在每次 `sql_query` 期间强制开启 `PRAGMA query_only = ON`（`readOnly` 连接持久开启并启用防御模式）；MySQL 与 PostgreSQL 每次查询都在独立 `READ ONLY` 事务中运行并回滚（PostgreSQL 使用扩展协议拒绝多命令；对无参数的有界 `SELECT` / `WITH` / `VALUES` / `TABLE` 查询，优先在事务内声明 `NO SCROLL CURSOR` 并 `FETCH`，回滚后安全归还连接池复用，其余情况自动回退到流式读取）。
-- **服务端超时与尽力取消**：遵守宿主 `exec.signal` 与 `queryTimeoutMs` / `execTimeoutMs`；查询与写超时均会下发到数据库服务端（PostgreSQL 查询使用事务内 `SET LOCAL statement_timeout`，`PostgresAdapter.exec()` 使用 `SET statement_timeout` 并在结束时 `RESET statement_timeout`；MySQL 使用驱动 `timeout`）；请求中止或超时时，除销毁专用连接外还会尽力发送服务端取消指令（PostgreSQL `SELECT pg_cancel_backend($1)`、MySQL `KILL QUERY ?`）（注：Node 内置 `node:sqlite` 为同步执行，避免对未知超大表跑无界复杂笛卡尔积）。
+- **超时与取消**：遵守宿主 `exec.signal` 与 `queryTimeoutMs` / `execTimeoutMs`。SQLite 在独立进程中执行，长查询不会阻塞宿主；超时或执行中取消会终止数据库进程，并等待退出后返回错误。同一连接的请求串行执行，排队请求单独取消不会影响正在运行的请求。PostgreSQL 查询使用事务内 `SET LOCAL statement_timeout`，写操作使用 `SET/RESET statement_timeout`；MySQL 使用驱动 `timeout`。中止 MySQL/PostgreSQL 请求时还会尽力发送服务端取消指令（`KILL QUERY ?` / `pg_cancel_backend`），并销毁专用连接。
+- **SQLite 中断后的连接状态**：文件库可在下次请求时重新打开，已提交数据保留；中断会丢失该连接的未提交事务、临时表及 `ATTACH` 等状态，因此中断时已排队的请求一并失败，插件不会自动重放写操作。`:memory:` 内存库无法恢复，连接会明确标记为失效；重新加载插件会创建新的空内存库，需保留的数据请使用文件库。如果写操作在返回结果前被中断，错误会提示结果可能已提交，必须先查询核对再决定是否重试。
 - **敏感列脱敏（`redactColumns`）**：默认 `false`（关闭），支持在原生设置面板热更新；设为 `true` 时启用 12 条内置不区分大小写子串规则（`password`、`passwd`、`pwd`、`secret`、`token`、`api_key`、`apikey`、`access_key`、`private_key`、`credential`、`auth_key`、`session_key`），也可传入自定义 `string[]`（普通子串不区分大小写，`/pattern/` 或 `/pattern/flags` 正则仅允许 `i` / `u` 标志）。命中的非空单元格在 `table` / `markdown` / `csv` / `json` 渲染前统一替换为 `[REDACTED]`（保留 `NULL`），结果附带 `redactedColumns` 并在 `sql_health` 中汇报状态。
 - **大整数、二进制与 JSON 友好渲染**：安全整数范围内保持 `number`，超出 `MAX_SAFE_INTEGER` 的 `bigint` 自动转为十进制字符串；`Uint8Array` / `Buffer` 在 ≤64 字节时输出 `0x...`，更大体积自动折叠为 `<BLOB N bytes, hex: 0x...>`；对象/数组（如 PostgreSQL `jsonb`）自动按 JSON 格式化，不出现 `[object Object]`。
 - **Markdown 表格、重复列名与耗时反馈**：`sql_query` 新增 `format: "markdown"` 输出标准 GFM Markdown 表格，默认 `table` 渲染也统一为 GFM Markdown 表格（受 20 行与 8000 字符预览上限保护）；`sql_query` 与 `sql_exec` 均返回并展示 `durationMs` 执行耗时；`format: "json"` 遇到同名列时自动输出 `{ columns, rows }` 不静默覆盖列值；四种格式在触发行数上限时均准确返回 `rowCount` 与截断提示。
